@@ -4,6 +4,7 @@
 #include "interaction_areas.hpp"
 #include "interaction_scoring.hpp"
 #include "molecule_io.hpp"
+#include "protein_area_crop.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -40,9 +41,13 @@ RescoringTarget::RescoringTarget(const RunConfig& config, bool full_protein)
     : protein(load_protein(config.protein_path.string())),
       vinardo(*protein)
 {
-    interaction_areas = get_protein_areas(*protein);
+    const auto crop_margin = protein_area_crop_margin();
+    const auto pocket = (crop_margin || !full_protein)
+        ? load_pocket(config.pocket_path.string()) : nullptr;
+    interaction_areas = pocket
+        ? prepare_protein_areas(config.protein_path, *protein, *pocket)
+        : get_protein_areas(*protein);
     if (!full_protein) {
-        const auto pocket = load_pocket(config.pocket_path.string());
         interaction_areas = filter_protein_areas_in_pocket(interaction_areas, *pocket);
     }
 }
@@ -195,6 +200,7 @@ void write_rescoring_protocol(
         const char* value = std::getenv(name);
         return std::string(value ? value : fallback);
     };
+    const auto crop_margin = protein_area_crop_margin();
 
     output << "key,value\n";
     write("complex_id", config.complex_id);
@@ -218,11 +224,18 @@ void write_rescoring_protocol(
     write("prefilter_order", "Fast score descending, then original pose_id ascending");
     write("export_order", "original clash-survivor order; no WeightedInteraction or Vinardo-like ranking");
     write("pose_id", "zero-based ordinal in the original clash-survivor sequence");
-    write("fast_region", "whole-protein chemical masks clipped to the pocket grid and margin");
-    write("interaction_region", full_protein ? "whole-protein physical interaction areas" :
+    write("fast_region", crop_margin
+        ? "cropped-protein chemical masks clipped to the pocket grid and margin"
+        : "whole-protein chemical masks clipped to the pocket grid and margin");
+    write("interaction_region", full_protein
+        ? (crop_margin ? "cropped-protein physical interaction areas" : "whole-protein physical interaction areas") :
         "physical areas whose every atom matches a pocket atom within 0.001 A");
     write("vinardo_like_region", "whole-protein supported heavy atoms; strict atom-pair distance < 8 A");
-    write("chemical_area_crop", "none; full protein used before pocket feature selection");
+    write("chemical_area_crop", crop_margin
+        ? "whole-residue PDB crop around pocket bounds before area detection; full protein for occupancy and clash"
+        : "none; full protein used before pocket feature selection");
+    write("chemical_area_crop_margin_A", crop_margin ? number(*crop_margin) : "off");
+    write("DOCKING_AREA_CROP_MARGIN_A", environment("DOCKING_AREA_CROP_MARGIN_A", "unset"));
     write("vinardo_like_crop", "none");
     write("vinardo_like_units", "experimental score; not validated Vinardo or kcal/mol");
     write("score_weights", "unchanged default Fast, WeightedInteraction and Vinardo-like coefficients");

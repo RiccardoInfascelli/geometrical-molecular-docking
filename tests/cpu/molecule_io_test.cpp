@@ -1,13 +1,25 @@
 #include "molecule_io.hpp"
+#include "protein_area_crop.hpp"
+#include "interaction_areas.hpp"
+
+#include <GraphMol/Atom.h>
+#include <GraphMol/Conformer.h>
+#include <GraphMol/MonomerInfo.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <limits>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -117,6 +129,185 @@ void test_record_edges(const fs::path& directory)
     require(open_error, "MOL2 open error changed");
 }
 
+struct ScopedCropEnvironment
+{
+    static constexpr const char* name = "DOCKING_AREA_CROP_MARGIN_A";
+    std::optional<std::string> previous;
+
+    ScopedCropEnvironment()
+    {
+        if (const char* value = std::getenv(name)) previous = value;
+    }
+
+    ~ScopedCropEnvironment()
+    {
+        if (previous) ::setenv(name, previous->c_str(), 1);
+        else ::unsetenv(name);
+    }
+
+    void set(const char* value)
+    {
+        require((value ? ::setenv(name, value, 1) : ::unsetenv(name)) == 0,
+                "Cannot set the crop test environment");
+    }
+};
+
+template <class Function>
+void require_throws(Function action, const char* message)
+{
+    bool rejected = false;
+    try {
+        action();
+    } catch (const std::exception&) {
+        rejected = true;
+    }
+    require(rejected, message);
+}
+
+std::string pdb_carbon(unsigned int serial, const char* record,
+                       char chain, int residue, char insertion,
+                       double x, double y, double z)
+{
+    std::string line(80, ' ');
+    const auto integer_field = [](unsigned int value, int width) {
+        std::ostringstream field;
+        field << std::setw(width) << value;
+        return field.str();
+    };
+    const auto coordinate_field = [](double value) {
+        std::ostringstream field;
+        field << std::fixed << std::setprecision(3) << std::setw(8) << value;
+        return field.str();
+    };
+    line.replace(0, 6, record);
+    line.replace(6, 5, integer_field(serial, 5));
+    const std::string atom_name = "C" + std::to_string(serial);
+    line.replace(12, atom_name.size(), atom_name);
+    line.replace(17, 3, "ALA");
+    line[21] = chain;
+    line.replace(22, 4, integer_field(static_cast<unsigned int>(residue), 4));
+    line[26] = insertion;
+    line.replace(30, 8, coordinate_field(x));
+    line.replace(38, 8, coordinate_field(y));
+    line.replace(46, 8, coordinate_field(z));
+    line.replace(54, 6, "  1.00");
+    line.replace(60, 6, "  0.00");
+    line[77] = 'C';
+    return line + '\n';
+}
+
+struct HeavyAtomPosition
+{
+    unsigned int atomic_number;
+    int serial;
+    double x, y, z;
+
+    bool operator==(const HeavyAtomPosition&) const = default;
+};
+
+std::vector<HeavyAtomPosition> heavy_atom_positions(const RDKit::ROMol& molecule)
+{
+    std::vector<HeavyAtomPosition> positions;
+    const auto& conformer = molecule.getConformer();
+    for (const auto* atom : molecule.atoms()) {
+        if (atom->getAtomicNum() == 1) continue;
+        const auto* residue = dynamic_cast<const RDKit::AtomPDBResidueInfo*>(
+            atom->getMonomerInfo());
+        require(residue != nullptr, "PDB roundtrip lost atom residue metadata");
+        const auto& position = conformer.getAtomPos(atom->getIdx());
+        positions.push_back({static_cast<unsigned int>(atom->getAtomicNum()), residue->getSerialNumber(),
+                             position.x, position.y, position.z});
+    }
+    return positions;
+}
+
+void test_crop_environment()
+{
+    ScopedCropEnvironment environment;
+    environment.set(nullptr);
+    require(!protein_area_crop_margin(), "Unset crop selector must disable cropping");
+    environment.set("8");
+    const auto margin = protein_area_crop_margin();
+    require(margin && *margin == 8.0, "Positive crop margin was not parsed");
+    for (const char* invalid : {"", "0", "-8", "nan", "inf", "8junk", "off"}) {
+        environment.set(invalid);
+        require_throws([] { protein_area_crop_margin(); },
+                       "Invalid crop selector must be rejected");
+    }
+}
+
+void test_whole_residue_crop(const fs::path& directory)
+{
+    const auto protein_path = directory / "crop-protein.pdb";
+    const auto pocket_path = directory / "crop-pocket.pdb";
+    // The pocket bounds are [-2, 2] on every axis; margin 8 gives [-10, 10].
+    write_input(pocket_path,
+        pdb_carbon(1, "ATOM  ", 'P', 1, ' ', -2.0, -2.0, -2.0) +
+        pdb_carbon(2, "ATOM  ", 'P', 2, ' ', 2.0, 2.0, 2.0) + "END\n");
+    // Keep input order and serials, including an outside atom preceding the
+    // selecting atom and HETATM sharing exactly the same residue key.
+    write_input(protein_path,
+        pdb_carbon(79, "ATOM  ", 'A', 1, ' ', 30.0, 30.0, 30.0) +
+        pdb_carbon(3, "ATOM  ", 'A', 1, ' ', 10.0, 10.0, 10.0) +
+        pdb_carbon(66, "HETATM", 'A', 1, ' ', -30.0, -30.0, -30.0) +
+        pdb_carbon(99, "ATOM  ", 'B', 1, ' ', 45.0, 45.0, 45.0) +
+        pdb_carbon(80, "ATOM  ", 'A', 1, 'A', 60.0, 60.0, 60.0) +
+        pdb_carbon(31, "ATOM  ", 'A', 2, ' ', 10.001, -10.0, -10.0) + "END\n");
+    auto full = load_protein(protein_path.string());
+    const auto pocket = load_pocket(pocket_path.string());
+    const auto original_positions = heavy_atom_positions(*full);
+    const auto original_atom_count = full->getNumAtoms();
+    const auto original_bond_count = full->getNumBonds();
+    require(original_positions.size() == 6, "Synthetic full PDB lost heavy atoms");
+
+    const auto crop = load_area_protein_crop(protein_path, *pocket, 8.0);
+    const std::vector<HeavyAtomPosition> expected{
+        {6, 79, 30.0, 30.0, 30.0},
+        {6, 3, 10.0, 10.0, 10.0},
+        {6, 66, -30.0, -30.0, -30.0}};
+    require(heavy_atom_positions(*crop) == expected,
+            "Crop must use inclusive box bounds, whole residues and original order/serials");
+
+    ScopedCropEnvironment environment;
+    environment.set("8");
+    prepare_protein_areas(protein_path, *full, *pocket);
+    environment.set(nullptr);
+    // With cropping disabled, feature extraction must use the supplied full
+    // molecule and must not reopen the source PDB.
+    const auto baseline = get_protein_areas(*full);
+    const auto disabled = prepare_protein_areas(directory / "absent-full-protein.pdb", *full, *pocket);
+    require(disabled.size() == baseline.size(), "Disabled crop changed the area count");
+    for (std::size_t i = 0; i < baseline.size(); ++i) {
+        const auto& a = baseline[i];
+        const auto& b = disabled[i];
+        require(a.pattern == b.pattern && a.pattern_class == b.pattern_class &&
+                a.num_atoms == b.num_atoms && a.centroid.x == b.centroid.x &&
+                a.centroid.y == b.centroid.y && a.centroid.z == b.centroid.z,
+                "Disabled crop changed area identity or order");
+        for (std::size_t j = 0; j < a.num_atoms; ++j)
+            require(a.x[j] == b.x[j] && a.y[j] == b.y[j] && a.z[j] == b.z[j],
+                    "Disabled crop changed area coordinates");
+    }
+    require(full->getNumAtoms() == original_atom_count &&
+            full->getNumBonds() == original_bond_count &&
+            heavy_atom_positions(*full) == original_positions,
+            "Area preparation must leave the original full molecule unchanged");
+
+    require_throws([&] {
+        load_area_protein_crop(directory / "missing-protein.pdb", *pocket, 8.0);
+    }, "Missing crop input must be rejected");
+    const auto far_path = directory / "crop-far.pdb";
+    write_input(far_path,
+        pdb_carbon(1, "ATOM  ", 'A', 1, ' ', 100.0, 100.0, 100.0) + "END\n");
+    require_throws([&] { load_area_protein_crop(far_path, *pocket, 8.0); },
+                   "A crop selecting no atoms must be rejected");
+    for (double invalid : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
+                           std::numeric_limits<double>::infinity()}) {
+        require_throws([&] { load_area_protein_crop(protein_path, *pocket, invalid); },
+                       "Invalid direct crop margins must be rejected");
+    }
+}
+
 } // namespace
 
 int main()
@@ -125,7 +316,9 @@ int main()
         const TemporaryDirectory directory;
         test_records(directory.path);
         test_record_edges(directory.path);
-        std::cout << "MOL2 streaming tests passed\n";
+        test_crop_environment();
+        test_whole_residue_crop(directory.path);
+        std::cout << "Molecule I/O tests passed\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

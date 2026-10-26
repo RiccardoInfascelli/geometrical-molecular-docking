@@ -29,6 +29,7 @@ add_library(docking_core
     src/matching_grid.cpp
     src/protein_grid.cpp
     src/protein_preparation.cpp
+    src/protein_area_crop.cpp
     src/ligand_preparation.cpp
     src/pose_generation.cpp
     src/stage_profile.cpp

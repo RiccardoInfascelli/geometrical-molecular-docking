@@ -10,6 +10,7 @@
 #include "pose_ranking.hpp"
 #include "pose_targets.hpp"
 #include "protein_grid.hpp"
+#include "protein_area_crop.hpp"
 #include "triplet_generation.hpp"
 
 #include <interaction/find_interaction.hpp>
@@ -54,10 +55,7 @@ RunResult run_pipeline(
         pocket->getNumAtoms();
 
 
-    const auto protein_areas =
-        get_protein_areas(
-            *protein
-        );
+    const auto protein_areas = prepare_protein_areas(config.protein_path, *protein, *pocket);
 
     result.protein_areas =
         protein_areas.size();
@@ -82,8 +80,8 @@ RunResult run_pipeline(
         protein_matching_areas.size();
 
 
-    // Occupancy and chemical masks use the full protein. Pocket filtering below
-    // limits target selection, not the receptor represented in the grid.
+    // Occupancy uses the full protein. Optional area cropping changes chemical
+    // masks and targets, independently of the pocket feature filter below.
 
     const GridBounds pocket_bounds =
         compute_pocket_bounds(
@@ -444,7 +442,7 @@ RunResult run_pipeline(
 
 
     // --------------------------------------------------------
-    // Crystal chemical interactions - full protein
+    // Crystal chemical interactions - detected protein areas (optionally cropped)
     // --------------------------------------------------------
 
     const auto interactions =

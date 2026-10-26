@@ -46,7 +46,7 @@ data representations, not execution of device kernels.
 | `rigid_alignment_quaternion_test` | The same alignment fixtures with quaternion Kabsch. | Same executable as `rigid_alignment_test`, with the quaternion environment selector. |
 | `pose_generation_test` | Original/cached clash equivalence, screening-only behavior, shared index, clearance pruning, pose order and profiling replay. | None. |
 | `pose_ranking_test` | Fast/unweighted/WeightedInteraction rankings, prefilter, ties and independence from RMSD. | None. |
-| `molecule_io_test` | MOL2 text streaming, record names, EOF, line endings and input errors; not RDKit chemical parsing. | Writable system temporary directory. |
+| `molecule_io_test` | MOL2 streaming; PDB whole-residue box crop, sanitization, atom order, OFF equivalence, selector validation and unchanged full-protein coordinates/connectivity. | Writable temporary directory. |
 | `pose_score_ranking_test` | Score directions, rep50/Hybrid normalization before Top-K, ties and invalid/nonfinite values. | None. |
 | `pose_rescoring_test` | Joint scores attached to the same pose IDs/transforms, full versus prefiltered pools, scorer selection and CSV contents. | None. |
 | `gpu_docking_config_test` | CLI defaults, validation, compatible options and environment precedence; input files are not opened. | None. |

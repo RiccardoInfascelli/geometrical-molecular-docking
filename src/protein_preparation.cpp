@@ -3,6 +3,7 @@
 #include "interaction_areas.hpp"
 #include "matching_areas.hpp"
 #include "molecule_io.hpp"
+#include "protein_area_crop.hpp"
 
 #include <chrono>
 
@@ -12,14 +13,15 @@ PreparedProtein prepare_protein(
 {
     auto protein = load_protein(config.protein_path.string());
     auto pocket = load_pocket(config.pocket_path.string());
-    const auto protein_areas = get_protein_areas(*protein);
+    const auto protein_areas = prepare_protein_areas(config.protein_path, *protein, *pocket);
     const auto protein_matching_areas = build_protein_matching_areas(protein_areas);
 
     PreparedProtein prepared;
     prepared.grid = build_empty_protein_grid(
         *pocket, config.grid_voxel_size, config.grid_margin);
     mark_protein_occupancy(*protein, prepared.grid);
-    // Grid interactions use all protein areas, before filtering target areas.
+    // Chemical masks use the detected areas (optionally cropped); occupancy above
+    // and target clearance below always use the full protein.
     mark_interaction_regions(protein_matching_areas, prepared.grid);
 
     // This distance is from each area centroid to the nearest pocket atom.

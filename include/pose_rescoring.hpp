@@ -14,6 +14,8 @@
 
 // WeightedInteraction uses pocket features by default; Vinardo-like always uses the full protein.
 // full_protein changes only the WeightedInteraction region, not the Vinardo receptor or clash.
+// An optional area crop applies before pocket selection; full_protein then means
+// all detected cropped areas. The original receptor remains available to Vinardo.
 // The owner keeps the loaded receptor available throughout the experiment.
 struct RescoringTarget
 {

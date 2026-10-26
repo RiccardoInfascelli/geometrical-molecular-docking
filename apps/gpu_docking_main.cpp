@@ -2,6 +2,7 @@
 // persists across records; the rescoring backend does not change the search backend.
 #include "gpu_docking_config.hpp"
 #include "molecule_io.hpp"
+#include "protein_area_crop.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -40,6 +41,7 @@ void write_summary(std::ostream& output, const GpuDockingCliOptions& options,
     const auto method = settings.ranking.method;
     const bool weighted_interaction = method == PoseScoreMethod::WeightedInteraction || method == PoseScoreMethod::Hybrid;
     const bool vinardo = method == PoseScoreMethod::Vinardo || method == PoseScoreMethod::Hybrid;
+    const auto crop_margin = protein_area_crop_margin();
     output << std::setprecision(17) << "key,value\n";
     const auto write = [&](const std::string& key, const auto& value) {
         output << key << ',' << value << '\n';
@@ -103,9 +105,16 @@ void write_summary(std::ostream& output, const GpuDockingCliOptions& options,
     write("vinardo_calculated", vinardo);
     write("hybrid_calculated", method == PoseScoreMethod::Hybrid);
     write("interaction_region", weighted_interaction ? (settings.interaction_full_protein ? "protein" : "pocket") : "not_calculated");
-    write("fast_region", "whole-protein chemical masks clipped to pocket grid and margin");
+    write("fast_region", crop_margin
+        ? "cropped-protein chemical masks clipped to pocket grid and margin"
+        : "whole-protein chemical masks clipped to pocket grid and margin");
     write("vinardo_region", vinardo ? "whole-protein supported heavy atoms; pair distance < 8 A" : "not_calculated");
-    write("protein_crop", "none; 8 A receptor crop unavailable in shared API");
+    write("protein_crop", csv_string(crop_margin
+        ? "whole-residue PDB crop around pocket bounds for chemical areas only; full protein for occupancy, clash and Vinardo"
+        : "none; full protein used for chemical areas, occupancy, clash and Vinardo"));
+    if (crop_margin) write("chemical_area_crop_margin_A", *crop_margin);
+    else write("chemical_area_crop_margin_A", "off");
+    write("DOCKING_AREA_CROP_MARGIN_A", environment("DOCKING_AREA_CROP_MARGIN_A"));
     write("clustering", "none; unavailable in shared API");
     if (vinardo) {
         write("vinardo_alpha", settings.ranking.vinardo_alpha);

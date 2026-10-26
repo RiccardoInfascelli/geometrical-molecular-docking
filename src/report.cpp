@@ -283,7 +283,7 @@ void print_debug(
         << result.pocket_protein_areas
         << '\n'
 
-        << "Full-protein chemical interactions: "
+        << "Detected protein-area chemical interactions: "
         << result.crystal_interactions
         << '\n'
 
@@ -291,7 +291,7 @@ void print_debug(
         << result.pocket_interactions
         << '\n'
 
-        << "Full interacting ligand areas: "
+        << "Ligand areas interacting with detected protein areas: "
         << result.crystal_interacting_ligand_areas
         << '\n'
 

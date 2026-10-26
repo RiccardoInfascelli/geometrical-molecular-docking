@@ -22,6 +22,8 @@ struct PreparedProtein
 // Only the grid and targets are retained; molecule and area temporaries are
 // released before return. Triplet indexing and its cutoff belong to the caller.
 // Optional pruning runs after target selection and never modifies the grid.
+// DOCKING_AREA_CROP_MARGIN_A can crop the source of chemical masks and targets,
+// while occupancy and target clearance always use the full protein.
 // Clearance is in angstroms: nullopt disables the filter, while zero enables it.
 // Filter before indexing; target indices refer to the final vector order.
 PreparedProtein prepare_protein(

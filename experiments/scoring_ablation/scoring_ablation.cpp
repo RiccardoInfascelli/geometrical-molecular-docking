@@ -9,6 +9,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -320,7 +321,11 @@ int main(int argc, char** argv)
         setting("pose_id_source", "input pose_id; alignment_index only when pose_id column is absent");
         setting("pool_validation", "row count checked against declared size; upstream completeness must be checked in generation protocol");
         setting("interaction_region", options.interaction_region);
-        setting("chemical_area_crop", "none; standard RescoringTarget pocket selection or full protein");
+        const char* crop_margin = std::getenv("DOCKING_AREA_CROP_MARGIN_A");
+        setting("chemical_area_crop", crop_margin
+            ? "whole-residue pocket bounding-box crop before RescoringTarget area detection"
+            : "none; standard RescoringTarget pocket selection or full protein");
+        setting("DOCKING_AREA_CROP_MARGIN_A", crop_margin ? crop_margin : "unset");
         setting("vinardo_region", "full supported heavy-atom receptor; original strict 8 A pair cutoff");
         setting("weighted_interaction_ablation", "zero one reward; recompute max per physical ligand area with the existing scorer");
         setting("weighted_interaction_counts", "geometric contacts; retained when reward is zero; not additive weighted contributions");

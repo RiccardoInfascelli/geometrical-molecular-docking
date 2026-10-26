@@ -179,6 +179,12 @@ int main(int argc, char* argv[]) {
                   << ", fast top-" << top_n << "...\n";
         // This already computes WeightedInteraction scores on the Fast top-N candidate pool.
         const auto run = run_pipeline(config);
+        std::cout << "CPU search: candidate_matches=" << run.pose_generation.total_candidate_matches
+                  << " transforms_generated=" << run.pose_generation.transforms_generated
+                  << " survivors=" << run.pose_generation.surviving_poses.size() << '\n'
+                  << "Target preparation: " << run.timings.offline_target_preparation_seconds
+                  << " s; index + pose search: " << run.timings.online_pose_search_seconds
+                  << " s; CPU pipeline total: " << run.timings.total_seconds << " s\n";
         const auto& candidates = run.pose_ranking.weighted_interaction_candidates;
         if (candidates.empty()) {
             std::cerr << "Nessuna posa sopravvissuta al fast prefilter.\n";

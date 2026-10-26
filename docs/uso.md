@@ -27,6 +27,14 @@ This single-complex pipeline scores every clash survivor with Fast, then applies
 to the Fast top-500 and exports up to 20 ranked poses. Its protein index uses the ligand's
 interaction-area diameter. It does not expose the CUDA application's ranking, cutoff or Top-K flags.
 
+Set `DOCKING_AREA_CROP_MARGIN_A=8` to detect protein interaction areas on whole residues touching
+the pocket bounding box expanded by 8 Å. This can change Fast masks, targets and WeightedInteraction
+areas; its pocket filter still applies, while `--interaction-region protein` uses all cropped areas.
+Occupancy, target clearance and Vinardo-like keep the full protein. Unset the variable to disable
+cropping; zero is invalid. Shared host preparation and rescoring also apply this setting in CUDA
+applications. Use single-model PDB inputs for cropping. Crop mode and full/cropped atom counts
+are logged on stderr.
+
 The output contains `benchmark.csv` and a `1a1e/` subdirectory with `ranking.csv`,
 `pose_001.pdb`, subsequent pose files, copied reference structures and `view.pml` for PyMOL.
 The textual report is written to stdout.
