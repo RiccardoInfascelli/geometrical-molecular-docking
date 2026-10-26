@@ -64,6 +64,19 @@ void write_gpu_docking_pose_header(
 // and must have one entry per ranked pose in the same order. The header's
 // extended_scores flag must match. Without scores the original output is kept.
 // Pairing is positional: the caller must preserve score/pose identity.
+// A null SDF stream writes the same CSV without molecular serialization.
+void write_gpu_docking_poses(
+    std::ostream& csv,
+    std::ostream* sdf,
+    const RDKit::RWMol& ligand,
+    const std::vector<GpuPipelinePose>& ranked,
+    std::size_t record_index,
+    const std::string& molecule_id,
+    bool with_rmsd = false,
+    const RDKit::ROMol* reference = nullptr,
+    const std::vector<GpuDockingPoseScores>* scores = nullptr
+);
+
 void write_gpu_docking_poses(
     std::ostream& csv,
     std::ostream& sdf,

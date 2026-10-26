@@ -83,6 +83,7 @@ class BenchmarkTests(unittest.TestCase):
         for ranking in benchmark.RANKINGS:
             command = benchmark.command(args, ranking, "cuda", self.root / "new")
             self.assertIn("--continue-on-error", command)
+            self.assertIn("--no-sdf", command)
             self.assertIn("--timings", command)
             for flag, value in (("--cutoff", "24"), ("--kabsch", "quaternion"),
                                 ("--query-method", "optimized"), ("--top-k", "10"),

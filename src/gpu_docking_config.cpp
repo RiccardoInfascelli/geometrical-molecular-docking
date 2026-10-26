@@ -79,6 +79,7 @@ GpuDockingCliOptions parse_gpu_docking_options(int argc, char** argv) {
             throw std::invalid_argument("Duplicate option: " + flag);
         if (flag == "--timings") { result.settings.collect_timings = true; continue; }
         if (flag == "--continue-on-error") { result.continue_on_error = true; continue; }
+        if (flag == "--no-sdf") { result.no_sdf = true; continue; }
         if (flag != "--top-k" && flag != "--limit" && flag != "--cutoff" &&
             flag != "--reference-mol2" && flag != "--ranking" && flag != "--kabsch" &&
             flag != "--query-method" && flag != "--clash-threshold" &&
@@ -218,7 +219,8 @@ void write_gpu_docking_usage(std::ostream& output) {
         "  --hybrid-lambda FRACTION       Hybrid WeightedInteraction weight in [0,1] (default 0.3)\n"
         "  --rescoring-backend cpu|cuda   WeightedInteraction/Vinardo/Hybrid computation (default cpu)\n"
         "  --timings                     Write completed host wall intervals\n"
-        "  --continue-on-error           Record parse/dock failures and continue; exit nonzero on errors\n"
+        "  --no-sdf                      Export CSV only; do not serialize pose structures\n"
+        "  --continue-on-error           Record molecular failures and continue; exit nonzero on errors\n"
         "  --diagnostics off|stages      Stage diagnostics (default off)\n"
         "  --reference-mol2 FILE         Optional records paired by position and atom order\n"
         "CLI selectors override DOCKING_KABSCH_METHOD, DOCKING_QUERY_METHOD and\n"

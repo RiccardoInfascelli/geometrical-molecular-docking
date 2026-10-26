@@ -26,8 +26,8 @@ ctest --preset cuda-release -N
 ```
 
 With Python available, the root build registers 15 CPU tests, or 25 tests
-with CUDA enabled. Setting `DOCKING_TEST_COMPLEX` adds three integration
-cases, for 28 tests in a CUDA build.
+with CUDA enabled. Setting `DOCKING_TEST_COMPLEX` adds four integration
+cases, for 29 tests in a CUDA build with Python available.
 These counts describe registration, not results of an executed suite.
 
 ## Host synthetic tests: `cpu/`
@@ -90,6 +90,7 @@ No real molecular input files are required.
 | CTest name | What it checks | Additional prerequisites |
 | --- | --- | --- |
 | `cuda_real_pipeline_test` | Real target/index preparation and scans; CPU/CUDA transforms, clash counts/decisions, Fast scores and pipeline consistency on the generated alignments. | NVIDIA GPU and a readable complex directory, registered through `DOCKING_TEST_COMPLEX`. |
+| `gpu_docking_library_test` | Real CLI with valid/invalid/valid MOL2 records: CSV-only export, recovery, fail-fast behavior and unchanged counts/poses after an error. | Same real complex and GPU; Python 3. Uses temporary inputs/outputs and quaternion Kabsch. |
 
 The executable is built whenever CUDA and testing are enabled. It is registered
 in CTest only when `DOCKING_TEST_COMPLEX` is a nonempty **CMake cache path**;

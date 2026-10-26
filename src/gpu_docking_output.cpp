@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <memory>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
@@ -153,18 +154,20 @@ const std::vector<std::string>& extended_properties() {
     return properties;
 }
 
-void write_extended_scores(std::ostream& rows, RDKit::RWMol& molecule,
+void write_extended_scores(std::ostream& rows, RDKit::RWMol* molecule,
                            const GpuDockingPoseScores& scores) {
     validate_scores(scores);
-    for (const auto& property : extended_properties())
-        if (molecule.hasProp(property)) molecule.clearProp(property);
-    molecule.setProp("pose_id", std::to_string(scores.pose_id));
+    if (molecule) {
+        for (const auto& property : extended_properties())
+            if (molecule->hasProp(property)) molecule->clearProp(property);
+        molecule->setProp("pose_id", std::to_string(scores.pose_id));
+    }
     rows << ',' << scores.pose_id;
     const auto write_score = [&](const char* property, std::optional<double> value) {
         rows << ',';
         if (value) {
             rows << *value;
-            molecule.setProp(property, numeric_property(*value));
+            if (molecule) molecule->setProp(property, numeric_property(*value));
         }
     };
     write_score("weighted_interaction_score", scores.weighted_interaction
@@ -241,7 +244,17 @@ void write_gpu_docking_poses(std::ostream& csv, std::ostream& sdf,
                             std::size_t record_index, const std::string& molecule_id,
                             bool with_rmsd, const RDKit::ROMol* reference,
                             const std::vector<GpuDockingPoseScores>* scores) {
-    if (!csv || !sdf) throw std::runtime_error("GPU docking output stream is not writable");
+    write_gpu_docking_poses(csv, &sdf, ligand, ranked, record_index, molecule_id,
+                           with_rmsd, reference, scores);
+}
+
+void write_gpu_docking_poses(std::ostream& csv, std::ostream* sdf,
+                            const RDKit::RWMol& ligand,
+                            const std::vector<GpuPipelinePose>& ranked,
+                            std::size_t record_index, const std::string& molecule_id,
+                            bool with_rmsd, const RDKit::ROMol* reference,
+                            const std::vector<GpuDockingPoseScores>* scores) {
+    if (!csv || (sdf && !*sdf)) throw std::runtime_error("GPU docking output stream is not writable");
     if (reference && !with_rmsd)
         throw std::invalid_argument("RMSD reference supplied without the RMSD output column");
     if (scores && scores->size() != ranked.size())
@@ -252,13 +265,16 @@ void write_gpu_docking_poses(std::ostream& csv, std::ostream& sdf,
     // Stage a ligand's complete records before modifying the caller's streams.
     std::ostringstream rows, structures;
     rows << std::setprecision(17);
-    RDKit::SDWriter writer(&structures, false);
-    std::vector<std::string> properties = {
-        "molecule_id", "record_index", "rank", "alignment_index",
-        "fast_weighted_score", "clash_fraction", "occupied_atoms", "rmsd_heavy_A"};
-    if (scores) properties.insert(properties.end(), extended_properties().begin(),
-                                  extended_properties().end());
-    writer.setProps(properties);
+    std::unique_ptr<RDKit::SDWriter> writer;
+    if (sdf) {
+        writer = std::make_unique<RDKit::SDWriter>(&structures, false);
+        std::vector<std::string> properties = {
+            "molecule_id", "record_index", "rank", "alignment_index",
+            "fast_weighted_score", "clash_fraction", "occupied_atoms", "rmsd_heavy_A"};
+        if (scores) properties.insert(properties.end(), extended_properties().begin(),
+                                      extended_properties().end());
+        writer->setProps(properties);
+    }
     for (std::size_t i = 0; i < ranked.size(); ++i) {
         const auto& pose = ranked[i];
         if (!valid_pose(pose)) throw std::invalid_argument("Cannot export an invalid GPU docking pose");
@@ -266,24 +282,27 @@ void write_gpu_docking_poses(std::ostream& csv, std::ostream& sdf,
         validate_transform(pose.transform);
         if (!std::isfinite(pose.clash.fraction))
             throw std::invalid_argument("GPU docking pose has a nonfinite clash fraction");
-        RDKit::RWMol molecule(ligand);
-        auto& conformer = molecule.getConformer();
-        for (unsigned int atom = 0; atom < molecule.getNumAtoms(); ++atom)
-            conformer.setAtomPos(atom, transformed_point(conformer.getAtomPos(atom), pose.transform));
-        // SDF name occupies one line; retain the original ID as a property too.
-        std::string name = molecule_id;
-        std::replace(name.begin(), name.end(), '\n', ' ');
-        std::replace(name.begin(), name.end(), '\r', ' ');
-        molecule.setProp("_Name", name + " pose " + std::to_string(i + 1));
-        molecule.setProp("molecule_id", molecule_id);
-        molecule.setProp("record_index", std::to_string(record_index));
-        molecule.setProp("rank", std::to_string(i + 1));
-        molecule.setProp("alignment_index", std::to_string(pose.alignment_index));
-        molecule.setProp("fast_weighted_score", numeric_property(pose.fast_score.weighted_score));
-        molecule.setProp("clash_fraction", numeric_property(pose.clash.fraction));
-        molecule.setProp("occupied_atoms", std::to_string(pose.clash.occupied_atoms));
-        // Remove any same-named property inherited from an input SDF molecule.
-        if (molecule.hasProp("rmsd_heavy_A")) molecule.clearProp("rmsd_heavy_A");
+        std::unique_ptr<RDKit::RWMol> molecule;
+        if (writer) {
+            molecule = std::make_unique<RDKit::RWMol>(ligand);
+            auto& conformer = molecule->getConformer();
+            for (unsigned int atom = 0; atom < molecule->getNumAtoms(); ++atom)
+                conformer.setAtomPos(atom, transformed_point(conformer.getAtomPos(atom), pose.transform));
+            // SDF name occupies one line; retain the original ID as a property too.
+            std::string name = molecule_id;
+            std::replace(name.begin(), name.end(), '\n', ' ');
+            std::replace(name.begin(), name.end(), '\r', ' ');
+            molecule->setProp("_Name", name + " pose " + std::to_string(i + 1));
+            molecule->setProp("molecule_id", molecule_id);
+            molecule->setProp("record_index", std::to_string(record_index));
+            molecule->setProp("rank", std::to_string(i + 1));
+            molecule->setProp("alignment_index", std::to_string(pose.alignment_index));
+            molecule->setProp("fast_weighted_score", numeric_property(pose.fast_score.weighted_score));
+            molecule->setProp("clash_fraction", numeric_property(pose.clash.fraction));
+            molecule->setProp("occupied_atoms", std::to_string(pose.clash.occupied_atoms));
+            // Remove any same-named property inherited from an input SDF molecule.
+            if (molecule->hasProp("rmsd_heavy_A")) molecule->clearProp("rmsd_heavy_A");
+        }
         rows << record_index << ',' << csv_string(molecule_id) << ',' << i + 1 << ','
              << pose.alignment_index << ',' << pose.fast_score.weighted_score << ','
              << pose.clash.fraction << ',' << pose.clash.occupied_atoms;
@@ -294,16 +313,16 @@ void write_gpu_docking_poses(std::ostream& csv, std::ostream& sdf,
             if (reference) {
                 const double rmsd = validated_rmsd(ligand, pose.transform, *reference);
                 rows << rmsd;
-                molecule.setProp("rmsd_heavy_A", numeric_property(rmsd));
+                if (molecule) molecule->setProp("rmsd_heavy_A", numeric_property(rmsd));
             }
         }
-        if (scores) write_extended_scores(rows, molecule, scores->at(i));
+        if (scores) write_extended_scores(rows, molecule.get(), scores->at(i));
         rows << '\n';
-        writer.write(molecule);
+        if (writer) writer->write(*molecule);
     }
-    writer.flush();
+    if (writer) writer->flush();
     if (!structures || !rows) throw std::runtime_error("Could not prepare GPU docking output");
     csv << rows.str();
-    sdf << structures.str();
-    if (!csv || !sdf) throw std::runtime_error("Could not write GPU docking pose output");
+    if (sdf) *sdf << structures.str();
+    if (!csv || (sdf && !*sdf)) throw std::runtime_error("Could not write GPU docking pose output");
 }

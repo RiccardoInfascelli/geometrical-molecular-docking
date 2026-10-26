@@ -7,6 +7,7 @@
 #include "gpu_pose_search.hpp"
 
 #include <cuda_runtime_api.h>
+#include <GraphMol/SanitException.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -61,6 +62,7 @@ void write_summary(std::ostream& output, const GpuDockingCliOptions& options,
     write("successful_records", successful_records);
     write("failed_records", failed_records);
     write("continue_on_error", options.continue_on_error);
+    write("sdf_export", !options.no_sdf);
     write("top_k", options.top_k);
     write("limit", options.limit == std::numeric_limits<std::size_t>::max()
         ? "all" : std::to_string(options.limit));
@@ -230,14 +232,69 @@ int main(int argc, char** argv) {
             const auto parse_start = timed ? Clock::now() : Clock::time_point{};
             if (!reader.next(block, name)) break;
             const auto index = reader.index();
+            const char* record_stage = "parsing/sanitization";
             try {
                 std::unique_ptr<RDKit::RWMol> molecule;
                 GpuDockingResult result;
                 double parse_s = 0.0;
+                bool exporting = false;
                 try {
                     molecule = parse_ligand_mol2_block(block);
                     parse_s = timed ? elapsed(parse_start) : 0.0;
+                    record_stage = "preparation/search/ranking";
                     result = screen.dock(*molecule, options.top_k);
+                    if (settings.diagnostic_stages)
+                        write_stage_profile(std::cerr, "gpu_docking", index, result.stages);
+                    const auto export_start = timed ? Clock::now() : Clock::time_point{};
+                    std::unique_ptr<RDKit::RWMol> reference;
+                    // Pair references by record position. Ranking has already finished;
+                    // these coordinates are used only for atom mapping and RMSD export.
+                    if (reference_reader) {
+                        if (!reference_reader->next(reference_block, reference_name))
+                            throw std::runtime_error("Missing paired reference MOL2 record");
+                        reference = parse_ligand_mol2_block(reference_block);
+                        validate_gpu_docking_reference(*molecule, *reference);
+                    }
+                    exporting = true;
+                    record_stage = options.no_sdf ? "CSV export" : "SDF export";
+                    const auto sdf_name = options.no_sdf ? std::string{} :
+                        "record-" + std::to_string(index) + ".sdf";
+                    std::ofstream sdf;
+                    if (!options.no_sdf) {
+                        sdf.open(options.output / sdf_name);
+                        sdf.exceptions(std::ios::badbit | std::ios::failbit);
+                    }
+                    write_gpu_docking_poses(poses, options.no_sdf ? nullptr : &sdf,
+                        *molecule, result.poses, index, name, reference_reader != nullptr,
+                        reference.get(), extended ? &result.scores : nullptr);
+                    if (!options.no_sdf) sdf.close();
+                    poses.flush();
+                    const double export_s = timed ? elapsed(export_start) : 0.0;
+                    const char* status = result.ligand_triplets == 0 ? "no_triplets" :
+                                         result.poses.empty() ? "no_poses" : "ok";
+                    records << std::setprecision(17) << index << ',' << csv_string(name) << ','
+                        << status << ',' << result.diameter << ',' << (result.diameter > settings.cutoff) << ','
+                        << result.ligand_triplets << ',' << result.candidate_matches << ','
+                        << result.alignments << ',' << result.valid_transforms << ','
+                        << result.survivors << ',' << result.poses.size() << ',' << csv_string(sdf_name);
+                    if (extended) records << ',' << result.candidate_pool;
+                    if (options.continue_on_error) records << ',';
+                    records << '\n'; records.flush();
+                    if (timed) {
+                        timings << index << ',' << parse_s << ',' << result.timings.preparation_seconds
+                            << ',' << result.timings.search_seconds << ',' << result.timings.selection_seconds
+                            << ',' << export_s;
+                        if (extended) timings << ',' << result.timings.prefilter_seconds << ','
+                            << result.timings.weighted_interaction_seconds << ',' << result.timings.vinardo_seconds << ','
+                            << result.timings.chemical_preparation_seconds << ',' << result.timings.rescoring_upload_seconds << ','
+                            << result.timings.score_preparation_seconds << ','
+                            << result.timings.hybrid_seconds << ',' << result.timings.rescoring_download_seconds;
+                        timings << ',' << result.timings.query_preparation_seconds << ','
+                            << result.timings.gpu_search_seconds << ',' << result.timings.query_threads_requested << ','
+                            << result.timings.query_threads_used << '\n';
+                        timings.flush();
+                    }
+                    ++successful_records;
                 } catch (const GpuLigandSearchError&) {
                     throw; // A failed search must not become an expected dataset error.
                 } catch (const std::bad_alloc&) {
@@ -247,8 +304,10 @@ int main(int argc, char** argv) {
                 } catch (const std::ios_base::failure&) {
                     throw;
                 } catch (const std::exception& error) {
-                    if (!options.continue_on_error)
+                    if (!options.continue_on_error ||
+                        (exporting && !dynamic_cast<const RDKit::MolSanitizeException*>(&error)))
                         throw;
+                    const std::string reason = std::string(record_stage) + ": " + error.what();
                     // Docking is sequential. Continue only after cleanup has
                     // left a healthy, completed CUDA context for the next record.
                     const auto pending_error = cudaPeekAtLastError();
@@ -261,63 +320,23 @@ int main(int argc, char** argv) {
                             error.what() + "; CUDA synchronization failed: " + cudaGetErrorString(synchronized));
                     }
                     records << index << ',' << csv_string(name)
-                        << ",error,0,0,0,0,0,0,0,0,\"\"";
-                    if (extended) records << ",0";
-                    records << ',' << csv_string(error.what()) << '\n';
+                        << std::setprecision(17) << ",error," << result.diameter << ','
+                        << (result.diameter > settings.cutoff) << ',' << result.ligand_triplets << ','
+                        << result.candidate_matches << ',' << result.alignments << ','
+                        << result.valid_transforms << ',' << result.survivors << ",0,\"\"";
+                    if (extended) records << ',' << result.candidate_pool;
+                    records << ',' << csv_string(reason) << '\n';
                     records.flush();
-                    std::cerr << "Record " << index << " (" << name << "): " << error.what() << '\n';
+                    std::cerr << "Record " << index << " (" << name << "): " << reason << '\n';
                     ++failed_records;
                     ++processed;
                     continue;
                 }
-                if (settings.diagnostic_stages)
-                    write_stage_profile(std::cerr, "gpu_docking", index, result.stages);
-                const auto export_start = timed ? Clock::now() : Clock::time_point{};
-                std::unique_ptr<RDKit::RWMol> reference;
-                // Pair references by record position. Ranking has already finished;
-                // these coordinates are used only for atom mapping and RMSD export.
-                if (reference_reader) {
-                    if (!reference_reader->next(reference_block, reference_name))
-                        throw std::runtime_error("Missing paired reference MOL2 record");
-                    reference = parse_ligand_mol2_block(reference_block);
-                    validate_gpu_docking_reference(*molecule, *reference);
-                }
-                const auto sdf_name = "record-" + std::to_string(index) + ".sdf";
-                std::ofstream sdf(options.output / sdf_name);
-                sdf.exceptions(std::ios::badbit | std::ios::failbit);
-                write_gpu_docking_poses(poses, sdf, *molecule, result.poses, index, name,
-                    reference_reader != nullptr, reference.get(), extended ? &result.scores : nullptr);
-                sdf.close(); poses.flush();
-                const double export_s = timed ? elapsed(export_start) : 0.0;
-                const char* status = result.ligand_triplets == 0 ? "no_triplets" :
-                                     result.poses.empty() ? "no_poses" : "ok";
-                records << std::setprecision(17) << index << ',' << csv_string(name) << ','
-                    << status << ',' << result.diameter << ',' << (result.diameter > settings.cutoff) << ','
-                    << result.ligand_triplets << ',' << result.candidate_matches << ','
-                    << result.alignments << ',' << result.valid_transforms << ','
-                    << result.survivors << ',' << result.poses.size() << ',' << csv_string(sdf_name);
-                if (extended) records << ',' << result.candidate_pool;
-                if (options.continue_on_error) records << ',';
-                records << '\n'; records.flush();
-                if (timed) {
-                    timings << index << ',' << parse_s << ',' << result.timings.preparation_seconds
-                        << ',' << result.timings.search_seconds << ',' << result.timings.selection_seconds
-                        << ',' << export_s;
-                    if (extended) timings << ',' << result.timings.prefilter_seconds << ','
-                        << result.timings.weighted_interaction_seconds << ',' << result.timings.vinardo_seconds << ','
-                        << result.timings.chemical_preparation_seconds << ',' << result.timings.rescoring_upload_seconds << ','
-                        << result.timings.score_preparation_seconds << ','
-                        << result.timings.hybrid_seconds << ',' << result.timings.rescoring_download_seconds;
-                    timings << ',' << result.timings.query_preparation_seconds << ','
-                        << result.timings.gpu_search_seconds << ',' << result.timings.query_threads_requested << ','
-                        << result.timings.query_threads_used << '\n';
-                    timings.flush();
-                }
-                ++successful_records;
             } catch (const std::exception& error) {
                 // Fatal output/reference/resource errors and default fail-fast
                 // failures retain partial output without a completed summary.
-                throw std::runtime_error("Record " + std::to_string(index) + " (" + name + "): " + error.what());
+                throw std::runtime_error("Record " + std::to_string(index) + " (" + name +
+                    ") [" + record_stage + "]: " + error.what());
             }
             ++processed;
         }

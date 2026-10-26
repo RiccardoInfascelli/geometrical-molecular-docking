@@ -44,6 +44,8 @@ The output directory must be new. The default library is
 
 This is 84 executable invocations by default. Every invocation uses cutoff 24 Å,
 quaternion Kabsch, top-k 10, `--timings`, diagnostics off and stage profiling off.
+Every invocation uses `--no-sdf` for a CSV-only benchmark: no SDF files are
+written, while scientific CSV values and ordering remain unchanged.
 `--top-k K` changes the exported pose limit for the whole campaign. The legacy
 `DOCKING_STAGE_TIMINGS` and `DOCKING_KABSCH_TIMINGS` switches are removed from the
 executed environment because even their value `0` enables extra synchronization.
@@ -126,8 +128,7 @@ The default is exact CSV cell equality within each
 backend. Optional `--absolute-tolerance` and `--relative-tolerance` allow finite
 numeric score/transform differences; identities, statuses, error messages and
 integer counts remain exact. CPU and CUDA rescoring are not compared with each
-other. SDF files remain available for inspection; they are not part of the CSV
-comparison. Speedups are suppressed for incomplete or mismatching groups; the
+other. Speedups are suppressed for incomplete or mismatching groups; the
 runner returns nonzero if any comparison fails. Error-containing, fully processed
 campaigns with matching results return zero.
 

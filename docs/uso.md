@@ -77,7 +77,9 @@ Host query preparation stays serial unless `DOCKING_QUERY_THREADS=N` requests mo
 an `ENABLE_OPENMP=ON` build. Small inputs still run serially; timing output records actual usage.
 For long libraries, `gpu_docking --continue-on-error` records molecular errors and proceeds in input
 order; it returns a nonzero exit status if any record failed. This option cannot be combined with
-`--reference-mol2`. See the [OpenMP experiment](../experiments/openmp_queries/README.md) for the
+`--reference-mol2`. Add `--no-sdf` for CSV-only output; docking and ranking are unchanged,
+and the `sdf` field in `records.csv` stays empty. Use `--timings` to retain `timings.csv`.
+See the [OpenMP experiment](../experiments/openmp_queries/README.md) for the
 thread-count comparison, timing boundaries and completed-run error handling.
 
 ## Multi-ligand screening

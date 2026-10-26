@@ -16,8 +16,9 @@ struct GpuDockingCliOptions {
     // Export limit only; settings.fast_prefilter controls the rescoring pool.
     std::size_t top_k = 20;
     std::size_t limit = std::numeric_limits<std::size_t>::max();
-    // Recover per-record parsing/docking failures; reference pairing is excluded.
+    // Recover molecular record failures; reference pairing is excluded.
     bool continue_on_error = false;
+    bool no_sdf = false;
     std::string kabsch_method, query_method;
     // Each source is "cli", "environment", or "default".
     std::string kabsch_source, query_source, diagnostics_source;

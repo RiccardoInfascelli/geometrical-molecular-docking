@@ -5,6 +5,7 @@
 #include <GraphMol/Conformer.h>
 #include <GraphMol/FileParsers/FileParsers.h>
 #include <GraphMol/RWMol.h>
+#include <GraphMol/SanitException.h>
 #include <Geometry/point.h>
 
 #include <cmath>
@@ -165,6 +166,48 @@ void test_rmsd() {
     auto nonfinite = identity;
     nonfinite.rotation[0] = std::numeric_limits<double>::quiet_NaN();
     rejects([&] { gpu_pose_heavy_atom_rmsd(ligand, nonfinite, ligand); });
+}
+
+void test_csv_only_export() {
+    const auto ligand = molecule();
+    const std::vector<GpuPipelinePose> poses = {pose(3, 7.0), pose(5, 4.0)};
+    std::vector<GpuDockingPoseScores> scores(poses.size());
+    for (std::size_t i = 0; i < scores.size(); ++i) {
+        scores[i].pose_id = i + 9;
+        scores[i].weighted_interaction.emplace();
+        scores[i].weighted_interaction->weighted_score = 2.0 + i;
+        scores[i].vinardo.emplace();
+        scores[i].vinardo->total = -3.0 - i;
+        scores[i].vinardo_adjusted = -1.0 - i;
+        scores[i].hybrid = 0.3 + i;
+    }
+    std::ostringstream full_csv, sdf, csv_only;
+    write_gpu_docking_poses(full_csv, sdf, ligand, poses, 4, "same", true, &ligand, &scores);
+    write_gpu_docking_poses(csv_only, nullptr, ligand, poses, 4, "same", true, &ligand, &scores);
+    require(full_csv.str() == csv_only.str(), "Disabling SDF changed CSV scores, RMSD or pose order");
+    require(!sdf.str().empty(), "Default SDF export was disabled");
+
+    // A five-carbon aromatic ring cannot be kekulized. CSV export must not
+    // invoke the SDF writer or alter this deliberately invalid test molecule.
+    RDKit::RWMol aromatic;
+    for (unsigned int i = 0; i < 5; ++i) {
+        auto* atom = new RDKit::Atom(6);
+        atom->setIsAromatic(true);
+        aromatic.addAtom(atom, true, true);
+    }
+    for (unsigned int i = 0; i < 5; ++i) aromatic.addBond(i, (i + 1) % 5, RDKit::Bond::AROMATIC);
+    aromatic.addConformer(new RDKit::Conformer(5), true);
+    aromatic.updatePropertyCache(false);
+    std::ostringstream failed_csv, failed_sdf;
+    bool rejected = false;
+    try { write_gpu_docking_poses(failed_csv, failed_sdf, aromatic, {pose(1, 2)}, 1, "aromatic"); }
+    catch (const RDKit::KekulizeException&) { rejected = true; }
+    require(rejected, "The aromatic fixture no longer exercises SDF kekulization failure");
+    require(failed_csv.str().empty() && failed_sdf.str().empty(), "Failed SDF export committed partial data");
+    write_gpu_docking_poses(failed_csv, nullptr, aromatic, {pose(1, 2)}, 1, "aromatic");
+    require(!failed_csv.str().empty(), "CSV-only export still required kekulization");
+    for (const auto* bond : aromatic.bonds())
+        require(bond->getBondType() == RDKit::Bond::AROMATIC, "Export changed input bond orders");
 }
 
 void test_export() {
@@ -350,6 +393,7 @@ int main() {
     try {
         test_selection();
         test_rmsd();
+        test_csv_only_export();
         test_export();
         test_extended_export();
         std::cout << "GPU docking output tests passed\n";

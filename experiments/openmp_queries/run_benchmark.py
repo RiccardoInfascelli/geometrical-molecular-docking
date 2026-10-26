@@ -116,7 +116,7 @@ def command(args, ranking, backend, output):
     result = [str(args.executable), str(args.protein), str(args.pocket), str(args.ligands),
               str(output), "--limit", str(args.limit), "--top-k", str(args.top_k), "--cutoff", "24",
               "--kabsch", "quaternion", "--query-method", args.query_method,
-              "--ranking", ranking, "--timings", "--diagnostics", "off", "--continue-on-error"]
+              "--ranking", ranking, "--timings", "--diagnostics", "off", "--continue-on-error", "--no-sdf"]
     if ranking != "fast":
         result.extend(["--rescoring-backend", backend, "--fast-prefilter", "500"])
     if ranking in ("weighted-interaction", "hybrid"):

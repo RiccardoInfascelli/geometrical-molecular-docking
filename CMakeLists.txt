@@ -246,6 +246,12 @@ if(BUILD_TESTING)
                 set_tests_properties(cpu_cuda_docking_quaternion_test PROPERTIES
                     LABELS "cuda;integration"
                     ENVIRONMENT "DOCKING_KABSCH_METHOD=quaternion;DOCKING_CPU_CLASH_METHOD=original;DOCKING_CPU_SCREENING_ONLY=0;DOCKING_QUERY_METHOD=reference;DOCKING_PROFILE_STAGES=0")
+                if(Python3_Interpreter_FOUND)
+                    add_test(NAME gpu_docking_library_test COMMAND ${Python3_EXECUTABLE} -B
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/gpu_docking_library_test.py
+                        $<TARGET_FILE:gpu_docking> "${DOCKING_TEST_COMPLEX}")
+                    set_tests_properties(gpu_docking_library_test PROPERTIES LABELS "cuda;integration;python")
+                endif()
             endif()
         endif()
     endif()
