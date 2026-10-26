@@ -1,0 +1,60 @@
+{
+  "version": 2,
+  "configurePresets": [
+    {
+      "name": "cpu-release",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/cpu-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ENABLE_CUDA": "OFF",
+        "BUILD_TESTING": "ON",
+        "BUILD_EXPERIMENTS": "ON",
+        "TARGET_CPU_ARCHITECTURE": "generic"
+      }
+    },
+    {
+      "name": "cuda-release",
+      "inherits": "cpu-release",
+      "binaryDir": "${sourceDir}/build/cuda-release",
+      "cacheVariables": {
+        "ENABLE_CUDA": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "80"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "cpu-release",
+      "configurePreset": "cpu-release",
+      "jobs": 1
+    },
+    {
+      "name": "cuda-release",
+      "configurePreset": "cuda-release",
+      "jobs": 1
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "cpu-release",
+      "configurePreset": "cpu-release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 1
+      }
+    },
+    {
+      "name": "cuda-release",
+      "configurePreset": "cuda-release",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "jobs": 1
+      }
+    }
+  ]
+}

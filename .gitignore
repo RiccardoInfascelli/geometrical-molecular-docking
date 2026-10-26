@@ -1,0 +1,25 @@
+# Build trees and compiler output; source directories remain visible.
+/build/
+/build-*/
+.vscode/
+.DS_Store
+*.o
+*.so
+*.dylib
+*.a
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+# Python environments and caches are reproducible dependencies, not sources.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated scientific output stays on disk. Existing tracked results stay tracked.
+/results/
+/results-whole-protein/
+/results_flat_test/
+/test-output/
+/inspect/
