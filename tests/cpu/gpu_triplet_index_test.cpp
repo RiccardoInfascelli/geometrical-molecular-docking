@@ -5,11 +5,16 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace
 {
@@ -39,6 +44,56 @@ struct ScopedQueryMethod
         else unsetenv("DOCKING_QUERY_METHOD");
     }
 };
+
+struct ScopedQueryThreads
+{
+    bool had_previous;
+    std::string previous;
+
+    explicit ScopedQueryThreads(const char* threads)
+        : had_previous(std::getenv("DOCKING_QUERY_THREADS") != nullptr),
+          previous(had_previous ? std::getenv("DOCKING_QUERY_THREADS") : "")
+    {
+        require((threads ? setenv("DOCKING_QUERY_THREADS", threads, 1)
+                         : unsetenv("DOCKING_QUERY_THREADS")) == 0,
+                "Cannot set query preparation threads");
+    }
+
+    ~ScopedQueryThreads()
+    {
+        if (had_previous) setenv("DOCKING_QUERY_THREADS", previous.c_str(), 1);
+        else unsetenv("DOCKING_QUERY_THREADS");
+    }
+};
+
+void check_query_outputs_equal(const std::vector<GpuTripletKey>& expected_queries,
+                               const std::vector<GpuLigandTripletOrders>& expected_orders,
+                               const std::vector<GpuTripletKey>& queries,
+                               const std::vector<GpuLigandTripletOrders>& orders)
+{
+    require(queries.size() == expected_queries.size() && orders.size() == expected_orders.size(),
+            "Query preparation changed output sizes or exception prefixes");
+    for (std::size_t i = 0; i < queries.size(); ++i) {
+        require(queries[i].padding == expected_queries[i].padding,
+                "Query preparation changed packed padding");
+        for (std::size_t vertex = 0; vertex < 3; ++vertex) {
+            require(queries[i].keys[vertex] == expected_queries[i].keys[vertex] &&
+                    queries[i].distance_bins[vertex] == expected_queries[i].distance_bins[vertex],
+                    "Query preparation changed a key, bin or source order");
+        }
+    }
+    for (std::size_t i = 0; i < orders.size(); ++i) {
+        require(orders[i].equivalent_order_count == expected_orders[i].equivalent_order_count,
+                "Query preparation changed equivalent-order counts");
+        for (std::size_t order = 0; order < 6; ++order) {
+            for (std::size_t vertex = 0; vertex < 3; ++vertex) {
+                require(orders[i].equivalent_orders[order][vertex] ==
+                            expected_orders[i].equivalent_orders[order][vertex],
+                        "Query preparation changed equivalent-order content, order or unused slots");
+            }
+        }
+    }
+}
 
 void check_packed_queries(const std::vector<Triplet>& triplets, double bin_size,
                          const std::vector<GpuTripletKey>& queries,
@@ -251,6 +306,287 @@ void test_query_preparation()
             "Invalid method changed query outputs before throwing");
 }
 
+std::vector<Triplet> make_parallel_query_fixture()
+{
+    const auto hydrophobic = InteractionKey::Hydrophobic;
+    const double edge = 1.5;
+    const std::vector<Triplet> seeds{
+        {{19, 2, 47}, {hydrophobic, hydrophobic, hydrophobic}, {2, 2, 2}},
+        {{19, 2, 47}, {hydrophobic, hydrophobic, hydrophobic}, {2, 2, 3}},
+        {{19, 2, 47}, {InteractionKey::Aromatic, hydrophobic,
+                      InteractionKey::HydrogenDonor}, {2, 3, 4}},
+        {{19, 2, 47}, {hydrophobic, InteractionKey::Aromatic, hydrophobic},
+                     {1.25, 1.75, 2}},
+        {{19, 2, 47}, {hydrophobic, hydrophobic, hydrophobic}, {2.01, 2.02, 2.03}},
+        {{19, 2, 47}, {hydrophobic, hydrophobic, hydrophobic}, {0.01, 0.02, 0.03}},
+        {{19, 2, 47}, {hydrophobic, hydrophobic, hydrophobic},
+                     {std::nextafter(edge, 0.0), edge,
+                      std::nextafter(edge, std::numeric_limits<double>::infinity())}}
+    };
+    std::vector<Triplet> triplets;
+    triplets.reserve(8 * gpu_query_parallel_min_triplets + 37);
+    for (std::size_t i = 0; i < 8 * gpu_query_parallel_min_triplets + 37; ++i) {
+        Triplet triplet = seeds[i % seeds.size()];
+        // Unique indices detect reordered source rows even for equal signatures.
+        triplet.matching_area_indices = {3 * i + 2, 3 * i, 3 * i + 1};
+        triplets.push_back(triplet);
+    }
+    return triplets;
+}
+
+int available_query_team_size(int requested_threads)
+{
+    int used_threads = 1;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(requested_threads) shared(used_threads)
+    {
+#pragma omp single
+        used_threads = omp_get_num_threads();
+    }
+#else
+    (void)requested_threads;
+#endif
+    return used_threads;
+}
+
+void test_query_thread_selectors(const Triplet& triplet)
+{
+    const ScopedQueryMethod method("reference");
+    {
+        const ScopedQueryThreads threads(nullptr);
+        require(gpu_query_requested_threads() == 1,
+                "Unset query thread selector did not default to one");
+        GpuQueryPreparationInfo info;
+        require(info.requested_threads == 1 && info.used_threads == 1,
+                "Query preparation information did not default to serial");
+        info = {-1, -1};
+        std::vector<GpuTripletKey> queries;
+        std::vector<GpuLigandTripletOrders> orders;
+        make_gpu_ligand_triplet_queries({triplet}, 0.5, queries, orders, &info);
+        require(info.requested_threads == 1 && info.used_threads == 1,
+                "Default query preparation did not report serial execution");
+    }
+
+    const auto expect_rejected = [&triplet](const char* value, bool unsupported) {
+        const ScopedQueryThreads threads(value);
+        const auto check_message = [unsupported](const std::invalid_argument& error) {
+            const std::string message(error.what());
+            require(message.find("DOCKING_QUERY_THREADS") != std::string::npos,
+                    "Query thread error did not identify the selector");
+            require(!unsupported || message.find("OpenMP") != std::string::npos,
+                    "Unsupported query thread request did not explain the OpenMP requirement");
+        };
+        bool threw = false;
+        try {
+            (void)gpu_query_requested_threads();
+        } catch (const std::invalid_argument& error) {
+            check_message(error);
+            threw = true;
+        }
+        require(threw, "Invalid query thread selector was accepted by the parser");
+
+        for (const char* choice : {static_cast<const char*>(nullptr), "reference", "optimized"}) {
+            const ScopedQueryMethod method(choice);
+            for (const auto& input : {std::vector<Triplet>{}, std::vector<Triplet>{triplet}}) {
+                std::vector<GpuTripletKey> queries(2);
+                std::vector<GpuLigandTripletOrders> orders(3);
+                queries[0].padding = 99;
+                queries[1].distance_bins[2] = 123;
+                orders[0].equivalent_order_count = 99;
+                orders[2].equivalent_orders[5][2] = 456;
+                const auto previous_queries = queries;
+                const auto previous_orders = orders;
+                threw = false;
+                try {
+                    make_gpu_ligand_triplet_queries(input, 0.5, queries, orders);
+                } catch (const std::invalid_argument& error) {
+                    check_message(error);
+                    threw = true;
+                }
+                require(threw, "Invalid query thread selector was accepted by preparation");
+                check_query_outputs_equal(previous_queries, previous_orders, queries, orders);
+            }
+        }
+    };
+
+    for (const char* value : {"", "0", "-1", "+1", " 2", "2 ", "abc", "2x", "1.5",
+                              "999999999999999999999999999999999999"}) {
+        expect_rejected(value, false);
+    }
+    if (!gpu_query_openmp_available()) {
+        for (const char* value : {"2", "4", "8"}) {
+            expect_rejected(value, true);
+        }
+    }
+}
+
+void test_parallel_query_preparation()
+{
+#ifdef _OPENMP
+    struct ScopedDynamicTeams
+    {
+        int previous = omp_get_dynamic();
+        ScopedDynamicTeams() { omp_set_dynamic(0); }
+        ~ScopedDynamicTeams() { omp_set_dynamic(previous); }
+    } dynamic_teams;
+    require(gpu_query_openmp_available(), "OpenMP build did not report query OpenMP support");
+#else
+    require(!gpu_query_openmp_available(), "Serial build unexpectedly reported query OpenMP support");
+#endif
+    const auto triplets = make_parallel_query_fixture();
+    test_query_thread_selectors(triplets.front());
+
+    std::vector<GpuTripletKey> reference_queries;
+    std::vector<GpuLigandTripletOrders> reference_orders;
+    {
+        const ScopedQueryThreads threads("1");
+        const ScopedQueryMethod method("reference");
+        make_gpu_ligand_triplet_queries(triplets, 0.5, reference_queries, reference_orders);
+        check_packed_queries(triplets, 0.5, reference_queries, reference_orders);
+    }
+
+    for (const char* value : {"1", "2", "4", "8"}) {
+        const int requested_threads = std::stoi(value);
+        if (!gpu_query_openmp_available() && requested_threads > 1) continue;
+        const ScopedQueryThreads threads(value);
+        require(gpu_query_requested_threads() == requested_threads,
+                "Query thread selector was cached or parsed incorrectly");
+        const int available_threads = available_query_team_size(requested_threads);
+        for (const char* choice : {static_cast<const char*>(nullptr), "reference", "optimized"}) {
+            const ScopedQueryMethod method(choice);
+            std::vector<GpuTripletKey> queries(2);
+            std::vector<GpuLigandTripletOrders> orders(3);
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                GpuQueryPreparationInfo info{-1, -1};
+                make_gpu_ligand_triplet_queries(triplets, 0.5, queries, orders, &info);
+                require(info.requested_threads == requested_threads &&
+                        info.used_threads >= 1 && info.used_threads <= requested_threads,
+                        "Query preparation reported an invalid request or actual team size");
+                require(available_threads <= 1 || info.used_threads > 1,
+                        "Large query preparation stayed serial despite an available OpenMP team");
+                check_query_outputs_equal(reference_queries, reference_orders, queries, orders);
+            }
+            // Test empty, single-row and just-below-threshold serial fallbacks.
+            for (const auto size : {std::size_t{0}, std::size_t{1},
+                                    gpu_query_parallel_min_triplets - 1}) {
+                const std::vector<Triplet> small(triplets.begin(), triplets.begin() + size);
+                GpuQueryPreparationInfo info{-1, -1};
+                make_gpu_ligand_triplet_queries(small, 0.5, queries, orders, &info);
+                require(info.requested_threads == requested_threads && info.used_threads == 1,
+                        "Small query preparation did not report its serial fallback");
+                check_packed_queries(small, 0.5, queries, orders);
+            }
+            if (requested_threads > 2) {
+                const std::vector<Triplet> light(triplets.begin(),
+                    triplets.begin() + gpu_query_parallel_min_triplets);
+                GpuQueryPreparationInfo info;
+                make_gpu_ligand_triplet_queries(light, 0.5, queries, orders, &info);
+                require(info.used_threads == 1, "Insufficient work per thread must stay serial");
+                check_packed_queries(light, 0.5, queries, orders);
+            }
+        }
+    }
+#ifdef _OPENMP
+    // Both active and serialized enclosing regions must avoid nested teams.
+    const ScopedQueryThreads nested_threads("4");
+    for (const int enclosing_threads : {1, 2}) {
+        for (const char* choice : {"reference", "optimized"}) {
+            const ScopedQueryMethod method(choice);
+            std::vector<GpuTripletKey> queries;
+            std::vector<GpuLigandTripletOrders> orders;
+            GpuQueryPreparationInfo info{-1, -1};
+            std::exception_ptr failure;
+#pragma omp parallel num_threads(enclosing_threads) shared(queries, orders, info, failure)
+            {
+#pragma omp single
+                {
+                    try {
+                        make_gpu_ligand_triplet_queries(triplets, 0.5, queries, orders, &info);
+                    } catch (...) {
+                        failure = std::current_exception();
+                    }
+                }
+            }
+            if (failure) std::rethrow_exception(failure);
+            require(info.requested_threads == 4 && info.used_threads == 1,
+                    "Query preparation did not use its serial fallback inside an OpenMP region");
+            check_query_outputs_equal(reference_queries, reference_orders, queries, orders);
+        }
+    }
+#endif
+}
+
+void test_parallel_query_overflow_prefixes()
+{
+    const auto triplets = make_parallel_query_fixture();
+    const auto maximum = std::numeric_limits<std::uint32_t>::max();
+    std::vector<Triplet> failures;
+    Triplet invalid = triplets.front();
+    invalid.keys[0] = static_cast<InteractionKey>(256);
+    failures.push_back(invalid);
+    if constexpr (sizeof(std::size_t) > sizeof(std::uint32_t)) {
+        invalid = triplets.front();
+        invalid.distances[0] = (static_cast<double>(maximum) + 1.0) * 0.5;
+        failures.push_back(invalid);
+        invalid = triplets.front();
+        invalid.matching_area_indices[0] = static_cast<std::size_t>(maximum) + 1;
+        failures.push_back(invalid);
+    }
+
+    struct OverflowResult
+    {
+        std::vector<GpuTripletKey> queries;
+        std::vector<GpuLigandTripletOrders> orders;
+        std::string message;
+    };
+    const auto capture_overflow = [](const std::vector<Triplet>& input) {
+        OverflowResult result;
+        result.queries.resize(2);
+        result.orders.resize(3);
+        result.queries[0].padding = 99;
+        result.orders[0].equivalent_order_count = 99;
+        try {
+            make_gpu_ligand_triplet_queries(input, 0.5, result.queries, result.orders);
+        } catch (const std::overflow_error& error) {
+            result.message = error.what();
+        }
+        require(!result.message.empty(), "Invalid packed query did not throw overflow_error");
+        return result;
+    };
+
+    for (std::size_t failure = 0; failure < failures.size(); ++failure) {
+        for (const auto first_bad : {std::size_t{0}, gpu_query_parallel_min_triplets + 31}) {
+            auto input = triplets;
+            input[first_bad] = failures[failure];
+            // Different workers can fail with different messages. Source order
+            // must choose the first exception, independent of completion order.
+            input[input.size() - 2] = failures[(failure + 1) % failures.size()];
+            OverflowResult expected;
+            {
+                const ScopedQueryThreads threads("1");
+                const ScopedQueryMethod method("reference");
+                expected = capture_overflow(input);
+            }
+            const bool index_overflow = failure == 2;
+            require(expected.orders.size() == first_bad &&
+                    expected.queries.size() == first_bad + (index_overflow ? 1 : 0),
+                    "Serial overflow did not retain the expected output prefix");
+            for (const char* value : {"1", "2", "4", "8"}) {
+                if (!gpu_query_openmp_available() && std::stoi(value) > 1) continue;
+                const ScopedQueryThreads threads(value);
+                for (const char* choice : {"reference", "optimized"}) {
+                    const ScopedQueryMethod method(choice);
+                    const auto actual = capture_overflow(input);
+                    require(actual.message == expected.message,
+                            "Query preparation did not rethrow the first source-index overflow");
+                    check_query_outputs_equal(expected.queries, expected.orders,
+                                              actual.queries, actual.orders);
+                }
+            }
+        }
+    }
+}
+
 bool test_cpu_lookup()
 {
     const std::array<InteractionKey, 3> chemical_keys{
@@ -357,13 +693,17 @@ bool test_cpu_lookup()
 
 int main()
 {
+    const ScopedQueryThreads serial_threads("1");
     try {
         test_query_preparation();
+        test_parallel_query_preparation();
+        test_parallel_query_overflow_prefixes();
     } catch (const std::exception& error) {
         std::cerr << "Ligand query preparation failed: " << error.what() << '\n';
         return 1;
     }
     std::cout << "Reference and optimized ligand query preparation passed\n";
+    std::cout << "Query thread selection, parallel equivalence and overflow prefixes passed\n";
 
     if (!test_cpu_lookup()) {
         return 1;

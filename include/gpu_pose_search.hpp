@@ -40,6 +40,9 @@ struct GpuLigandSearchResult {
     GpuPosePipelineResult pipeline;
     std::size_t candidate_matches = 0;
     std::size_t alignments = 0;
+    double query_preparation_seconds = 0.0;
+    int query_threads_requested = 1;
+    int query_threads_used = 1;
 };
 
 // Adapt all downloaded survivors to host rescoring without changing order,
@@ -72,6 +75,7 @@ public:
 // Non-null stages enables the same diagnostic stage synchronizations as the
 // screening driver. Download intervals are collected only when requested;
 // pipeline stage timings are appended to stages, preserving its existing items.
+// collect_query_timings measures host packing without adding device synchronization.
 GpuLigandSearchResult run_gpu_ligand_search(
     const RDKit::ROMol& molecule,
     const PreparedLigand& ligand,
@@ -79,7 +83,8 @@ GpuLigandSearchResult run_gpu_ligand_search(
     const RunConfig& config,
     StageProfile* stages = nullptr,
     GpuPosePipelineTimings* download_timings = nullptr,
-    GpuPosePipelineDeviceResult* device_result = nullptr
+    GpuPosePipelineDeviceResult* device_result = nullptr,
+    bool collect_query_timings = false
 );
 
 #endif

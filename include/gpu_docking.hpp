@@ -19,6 +19,12 @@ enum class GpuRescoringBackend { Cpu, Cuda };
 struct GpuDockingTimings {
     double preparation_seconds = 0.0;
     double search_seconds = 0.0;
+    double query_preparation_seconds = 0.0;
+    // Search excluding query preparation; includes packing, copies, CUDA waits
+    // and cleanup. It is a completed wall interval, not isolated kernel time.
+    double gpu_search_seconds = 0.0;
+    int query_threads_requested = 1;
+    int query_threads_used = 1;
     double selection_seconds = 0.0;
     double prefilter_seconds = 0.0;
     double weighted_interaction_seconds = 0.0;

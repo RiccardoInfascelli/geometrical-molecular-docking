@@ -119,8 +119,13 @@ GpuDockingResult GpuDockingScreen::dock(RDKit::RWMol& molecule, std::size_t k) {
                                  settings.rescoring_backend == GpuRescoringBackend::Cuda;
     auto search = run_gpu_ligand_search(molecule, ligand, *impl_->target, impl_->config,
         settings.diagnostic_stages ? &output.stages : nullptr, nullptr,
-        device_rescoring ? &device_pool : nullptr);
+        device_rescoring ? &device_pool : nullptr, timed);
     output.timings.search_seconds = elapsed(start, timed);
+    output.timings.query_preparation_seconds = timed ? search.query_preparation_seconds : 0.0;
+    output.timings.gpu_search_seconds = timed
+        ? output.timings.search_seconds - search.query_preparation_seconds : 0.0;
+    output.timings.query_threads_requested = search.query_threads_requested;
+    output.timings.query_threads_used = search.query_threads_used;
     output.candidate_matches = search.candidate_matches;
     output.alignments = search.alignments;
     output.valid_transforms = search.pipeline.valid_transform_count;
@@ -142,9 +147,17 @@ GpuDockingResult GpuDockingScreen::dock(RDKit::RWMol& molecule, std::size_t k) {
         output.candidate_pool = rescored.candidate_pool;
         const auto prep_s = output.timings.preparation_seconds;
         const auto search_s = output.timings.search_seconds;
+        const auto query_s = output.timings.query_preparation_seconds;
+        const auto gpu_s = output.timings.gpu_search_seconds;
+        const auto requested_threads = output.timings.query_threads_requested;
+        const auto used_threads = output.timings.query_threads_used;
         output.timings = rescored.timings;
         output.timings.preparation_seconds = prep_s;
         output.timings.search_seconds = search_s;
+        output.timings.query_preparation_seconds = query_s;
+        output.timings.gpu_search_seconds = gpu_s;
+        output.timings.query_threads_requested = requested_threads;
+        output.timings.query_threads_used = used_threads;
         return output;
     }
 
@@ -165,7 +178,8 @@ GpuDockingResult GpuDockingScreen::dock(RDKit::RWMol& molecule, std::size_t k) {
         output.timings.vinardo_seconds = rescored.vinardo_scoring_seconds;
     }
     start = start_timer(timed);
-    const auto ranked = rank_rescored_poses(rescored, settings.ranking, k);
+    const auto ranked = rank_rescored_poses(rescored, settings.ranking, k,
+        timed ? &output.timings.hybrid_seconds : nullptr);
     for (const auto& row : ranked) {
         const auto& scored = row.scored;
         output.poses.push_back(search.pipeline.poses.at(scored.pose_id));

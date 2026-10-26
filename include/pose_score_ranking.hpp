@@ -56,9 +56,12 @@ double vinardo_adjusted_score(const VinardoLikeScore& terms, double alpha);
 // score and pose_id retain input order.
 // top_k must be positive. Validate every Fast score and every calculated method
 // score, including rows outside top_k. A valid empty pool returns empty.
+// Optional timing covers only Hybrid normalization/combination, not selection;
+// it is a subinterval of the caller's complete ranking time.
 std::vector<RankedPoseScore> rank_rescored_poses(
     const PoseRescoringResult& result,
     const PoseScoreRankingOptions& options,
-    std::size_t top_k);
+    std::size_t top_k,
+    double* hybrid_normalization_seconds = nullptr);
 
 #endif // POSE_SCORE_RANKING_HPP

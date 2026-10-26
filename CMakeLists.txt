@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(ENABLE_CUDA "Build the CUDA docking backend" OFF)
+option(ENABLE_OPENMP "Enable optional host triplet-query parallelism" OFF)
 option(BUILD_EXPERIMENTS "Build the diagnostic and experimental drivers" ON)
 include(CTest)
 set(DOCKING_TEST_COMPLEX "" CACHE PATH
@@ -49,6 +50,11 @@ add_library(docking_core
     src/cuda/cuda_fast_scoring.cpp)
 target_include_directories(docking_core PUBLIC include)
 target_link_libraries(docking_core PUBLIC libinteraction Eigen3::Eigen)
+if(ENABLE_OPENMP)
+    find_package(OpenMP REQUIRED COMPONENTS CXX)
+    target_link_libraries(docking_core PUBLIC OpenMP::OpenMP_CXX)
+    target_compile_definitions(docking_core PUBLIC DOCKING_ENABLE_OPENMP)
+endif()
 
 # Compile each scorer once; applications and isolated experiments share it.
 add_library(docking_rescoring
@@ -142,6 +148,8 @@ if(BUILD_EXPERIMENTS)
     add_executable(offline_profile_experiment experiments/profiling/offline_profile_experiment_main.cpp)
     target_link_libraries(offline_profile_experiment PRIVATE docking_core)
     bsl_set_cxx_flags(offline_profile_experiment)
+    add_executable(query_preparation_bench experiments/openmp_queries/query_preparation_bench.cpp)
+    target_link_libraries(query_preparation_bench PRIVATE docking_core)
     add_executable(ligand_diameter_stats experiments/analysis/ligand_diameter_stats.cpp)
     target_link_libraries(ligand_diameter_stats PRIVATE docking_core)
     bsl_set_cxx_flags(ligand_diameter_stats)

@@ -41,7 +41,7 @@ data representations, not execution of device kernels.
 | `gpu_fast_scoring_test` | Host packing of matching-area coordinates, chemical masks and Fast weights. | None; no scoring kernel is run. |
 | `gpu_grid_test` | Host grid conversion, voxel occupancy, masks and dimensions. | None. |
 | `gpu_geometry_test` | Conversion and ordering of ligand features, protein targets and atom coordinates. | None. |
-| `gpu_triplet_index_test` | Hash/flat neighbor lookup content and order; index conversion; reference/optimized queries, permutations, bin boundaries and invalid inputs. | None. |
+| `gpu_triplet_index_test` | Hash/flat lookup and packing; reference/optimized query equivalence, ordering, boundaries, overflow and serial/OpenMP behavior. | OpenMP checks use `ENABLE_OPENMP=ON`; the default build checks unavailable-thread errors. |
 | `rigid_alignment_test` | SVD rigid fits, proper rotations, residuals and degenerate/noncongruent triangles. | CTest selects SVD. |
 | `rigid_alignment_quaternion_test` | The same alignment fixtures with quaternion Kabsch. | Same executable as `rigid_alignment_test`, with the quaternion environment selector. |
 | `pose_generation_test` | Original/cached clash equivalence, screening-only behavior, shared index, clearance pruning, pose order and profiling replay. | None. |

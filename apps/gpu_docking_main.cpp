@@ -1,8 +1,12 @@
 // Configurable CUDA search with per-record ranking and pose export. The target
 // persists across records; the rescoring backend does not change the search backend.
 #include "gpu_docking_config.hpp"
+#include "cuda_triplet_index.hpp"
 #include "molecule_io.hpp"
 #include "protein_area_crop.hpp"
+#include "gpu_pose_search.hpp"
+
+#include <cuda_runtime_api.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -12,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 
@@ -35,7 +40,8 @@ std::string csv_string(const std::string& value) {
 
 void write_summary(std::ostream& output, const GpuDockingCliOptions& options,
                    const GpuDockingScreen& screen, std::size_t processed,
-                   double wall_before_summary) {
+                   std::size_t successful_records, std::size_t failed_records,
+                   double wall_before_summary, int query_threads_requested) {
     const auto& config = options.config;
     const auto& settings = options.settings;
     const auto method = settings.ranking.method;
@@ -50,8 +56,11 @@ void write_summary(std::ostream& output, const GpuDockingCliOptions& options,
         const char* value = std::getenv(key);
         return csv_string(value ? value : "unset");
     };
-    write("status", "complete");
+    write("status", failed_records ? "complete_with_errors" : "complete");
     write("processed", processed);
+    write("successful_records", successful_records);
+    write("failed_records", failed_records);
+    write("continue_on_error", options.continue_on_error);
     write("top_k", options.top_k);
     write("limit", options.limit == std::numeric_limits<std::size_t>::max()
         ? "all" : std::to_string(options.limit));
@@ -93,14 +102,25 @@ void write_summary(std::ostream& output, const GpuDockingCliOptions& options,
     write("kabsch_source", options.kabsch_source);
     write("query_method_effective", options.query_method);
     write("query_source", options.query_source);
+    write("query_threads_requested", query_threads_requested);
+    write("query_openmp_available", gpu_query_openmp_available());
+    write("query_parallel_min_triplets", gpu_query_parallel_min_triplets);
+    write("query_min_triplets_per_requested_thread", gpu_query_min_per_thread);
+    write("query_threads_used_source", "timings.csv per successful record when timings enabled; serial fallback uses one");
     write("DOCKING_KABSCH_METHOD", environment("DOCKING_KABSCH_METHOD"));
     write("DOCKING_QUERY_METHOD", environment("DOCKING_QUERY_METHOD"));
+    write("DOCKING_QUERY_THREADS", environment("DOCKING_QUERY_THREADS"));
     write("diagnostics_effective", settings.diagnostic_stages ? "stages" : "off");
     write("diagnostics_source", options.diagnostics_source);
     write("DOCKING_PROFILE_STAGES", environment("DOCKING_PROFILE_STAGES"));
     write("DOCKING_STAGE_TIMINGS", environment("DOCKING_STAGE_TIMINGS"));
     write("DOCKING_KABSCH_TIMINGS", environment("DOCKING_KABSCH_TIMINGS"));
     write("timings_enabled", settings.collect_timings);
+    write("timing_overlap_policy", "sequential records; no pipelined CPU/GPU overlap across records");
+    write("query_preparation_scope", "host query packing; included in search_completed_s");
+    write("gpu_search_scope", "search_completed_s minus query_preparation_s; completed mixed CUDA wrapper interval; not kernel time");
+    write("timing_aggregation", "query_preparation_s plus gpu_search_s replaces search_completed_s; CPU hybrid_normalization_s is included in top_k_selection_s");
+    write("timings_failed_records", "omitted from timings.csv; included in wall_before_summary_s");
     write("weighted_interaction_calculated", weighted_interaction);
     write("vinardo_calculated", vinardo);
     write("hybrid_calculated", method == PoseScoreMethod::Hybrid);
@@ -153,10 +173,11 @@ void write_summary(std::ostream& output, const GpuDockingCliOptions& options,
         write("weighted_interaction_weight_ionic", weights.ionic);
         write("weighted_interaction_weight_metal", weights.metal);
     }
-    if (settings.collect_timings) {
+    if (settings.collect_timings)
         write("startup_s", screen.startup_seconds());
-        write("wall_before_summary_s", wall_before_summary);
-    }
+    write("wall_before_summary_s", wall_before_summary);
+    write("successful_ligands_per_s", wall_before_summary > 0.0
+        ? static_cast<double>(successful_records) / wall_before_summary : 0.0);
 }
 
 } // namespace
@@ -167,6 +188,7 @@ int main(int argc, char** argv) {
             write_gpu_docking_usage(std::cout); return 0;
         }
         const auto options = parse_gpu_docking_options(argc, argv);
+        const int query_threads_requested = gpu_query_requested_threads();
         const auto& settings = options.settings;
         const bool timed = settings.collect_timings;
         const bool extended = settings.ranking.method != PoseScoreMethod::Fast;
@@ -177,7 +199,7 @@ int main(int argc, char** argv) {
         if (!options.references.empty()) reference_reader = std::make_unique<Mol2Reader>(options.references);
         if (fs::exists(options.output)) throw std::runtime_error("Output already exists: " + options.output.string());
         apply_gpu_docking_environment(options);
-        const auto run_start = timed ? Clock::now() : Clock::time_point{};
+        const auto run_start = Clock::now();
         GpuDockingScreen screen(options.config, settings);
         if (!fs::create_directories(options.output)) throw std::runtime_error("Cannot create output directory");
         std::ofstream poses(options.output / "poses.csv"), records(options.output / "records.csv");
@@ -187,6 +209,7 @@ int main(int argc, char** argv) {
         records << "record_index,molecule_id,status,diameter_A,diameter_gt_cutoff,ligand_triplets,"
                    "candidate_matches,alignments,valid_transforms,survivors,exported_poses,sdf";
         if (extended) records << ",candidate_pool";
+        if (options.continue_on_error) records << ",error";
         records << '\n';
         std::ofstream timings;
         if (timed) {
@@ -198,18 +221,55 @@ int main(int argc, char** argv) {
             if (extended) timings << ",fast_prefilter_s,weighted_interaction_scoring_s,vinardo_scoring_s,"
                 "rescoring_chemical_preparation_s,rescoring_h2d_s,rescoring_score_preparation_s,"
                 "hybrid_normalization_s,rescoring_top_k_d2h_s";
-            timings << '\n';
+            timings << ",query_preparation_s,gpu_search_s,query_threads_requested,query_threads_used\n";
         }
         std::size_t processed = 0;
+        std::size_t successful_records = 0, failed_records = 0;
         std::string block, name, reference_block, reference_name;
         while (processed < options.limit) {
             const auto parse_start = timed ? Clock::now() : Clock::time_point{};
             if (!reader.next(block, name)) break;
             const auto index = reader.index();
             try {
-                auto molecule = parse_ligand_mol2_block(block);
-                const double parse_s = timed ? elapsed(parse_start) : 0.0;
-                auto result = screen.dock(*molecule, options.top_k);
+                std::unique_ptr<RDKit::RWMol> molecule;
+                GpuDockingResult result;
+                double parse_s = 0.0;
+                try {
+                    molecule = parse_ligand_mol2_block(block);
+                    parse_s = timed ? elapsed(parse_start) : 0.0;
+                    result = screen.dock(*molecule, options.top_k);
+                } catch (const GpuLigandSearchError&) {
+                    throw; // A failed search must not become an expected dataset error.
+                } catch (const std::bad_alloc&) {
+                    throw;
+                } catch (const fs::filesystem_error&) {
+                    throw;
+                } catch (const std::ios_base::failure&) {
+                    throw;
+                } catch (const std::exception& error) {
+                    if (!options.continue_on_error)
+                        throw;
+                    // Docking is sequential. Continue only after cleanup has
+                    // left a healthy, completed CUDA context for the next record.
+                    const auto pending_error = cudaPeekAtLastError();
+                    if (pending_error != cudaSuccess)
+                        throw std::runtime_error(std::string("Cannot continue after CUDA failure: ") +
+                            error.what() + "; " + cudaGetErrorString(pending_error));
+                    const auto synchronized = cudaDeviceSynchronize();
+                    if (synchronized != cudaSuccess) {
+                        throw std::runtime_error(std::string("Cannot continue after record failure: ") +
+                            error.what() + "; CUDA synchronization failed: " + cudaGetErrorString(synchronized));
+                    }
+                    records << index << ',' << csv_string(name)
+                        << ",error,0,0,0,0,0,0,0,0,\"\"";
+                    if (extended) records << ",0";
+                    records << ',' << csv_string(error.what()) << '\n';
+                    records.flush();
+                    std::cerr << "Record " << index << " (" << name << "): " << error.what() << '\n';
+                    ++failed_records;
+                    ++processed;
+                    continue;
+                }
                 if (settings.diagnostic_stages)
                     write_stage_profile(std::cerr, "gpu_docking", index, result.stages);
                 const auto export_start = timed ? Clock::now() : Clock::time_point{};
@@ -237,6 +297,7 @@ int main(int argc, char** argv) {
                     << result.alignments << ',' << result.valid_transforms << ','
                     << result.survivors << ',' << result.poses.size() << ',' << csv_string(sdf_name);
                 if (extended) records << ',' << result.candidate_pool;
+                if (options.continue_on_error) records << ',';
                 records << '\n'; records.flush();
                 if (timed) {
                     timings << index << ',' << parse_s << ',' << result.timings.preparation_seconds
@@ -247,11 +308,15 @@ int main(int argc, char** argv) {
                         << result.timings.chemical_preparation_seconds << ',' << result.timings.rescoring_upload_seconds << ','
                         << result.timings.score_preparation_seconds << ','
                         << result.timings.hybrid_seconds << ',' << result.timings.rescoring_download_seconds;
-                    timings << '\n'; timings.flush();
+                    timings << ',' << result.timings.query_preparation_seconds << ','
+                        << result.timings.gpu_search_seconds << ',' << result.timings.query_threads_requested << ','
+                        << result.timings.query_threads_used << '\n';
+                    timings.flush();
                 }
+                ++successful_records;
             } catch (const std::exception& error) {
-                // Unlike screening, stop at the first failed record. Partial
-                // output is retained, but no completed run summary is written.
+                // Fatal output/reference/resource errors and default fail-fast
+                // failures retain partial output without a completed summary.
                 throw std::runtime_error("Record " + std::to_string(index) + " (" + name + "): " + error.what());
             }
             ++processed;
@@ -261,15 +326,19 @@ int main(int argc, char** argv) {
             throw std::runtime_error("Reference MOL2 has more records than the input");
         poses.close(); records.close();
         if (timed) timings.close();
-        const double wall_before_summary = timed ? elapsed(run_start) : 0.0;
+        const double wall_before_summary = elapsed(run_start);
         const auto summary_temporary = options.output / "summary.csv.tmp";
         std::ofstream summary(summary_temporary);
         summary.exceptions(std::ios::badbit | std::ios::failbit);
-        write_summary(summary, options, screen, processed, wall_before_summary);
+        write_summary(summary, options, screen, processed, successful_records, failed_records,
+            wall_before_summary, query_threads_requested);
         summary.close();
         fs::rename(summary_temporary, options.output / "summary.csv");
-        std::cout << "Processed " << processed << " ligands; results: " << options.output << '\n';
-        return 0;
+        std::cout << "Processed " << processed << " ligands";
+        if (options.continue_on_error)
+            std::cout << " (" << successful_records << " successful; " << failed_records << " failed)";
+        std::cout << "; results: " << options.output << '\n';
+        return failed_records ? 1 : 0;
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n'; return 1;
     }

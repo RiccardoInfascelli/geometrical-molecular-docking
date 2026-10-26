@@ -69,6 +69,7 @@ void test_defaults_and_values() {
             defaults.config.output_mode == OutputMode::Quiet, "RunConfig paths/mode differ");
     require(defaults.top_k == 20 && defaults.limit == std::numeric_limits<std::size_t>::max(),
             "Default record/pose limits differ");
+    require(!defaults.continue_on_error, "Per-record error recovery became enabled by default");
     require(defaults.settings.cutoff == 24.0 && defaults.ranking_requested == "fast" &&
             defaults.settings.ranking.method == PoseScoreMethod::Fast &&
             defaults.settings.rescoring_backend == GpuRescoringBackend::Cpu &&
@@ -101,6 +102,9 @@ void test_defaults_and_values() {
             "Explicit OFF clearance became active");
     require(parse({"--clash-threshold", "0"}).config.operational_clash_threshold == 0.0,
             "Clash threshold lower endpoint rejected");
+    const auto continued = parse({"--continue-on-error", "--limit", "7"});
+    require(continued.continue_on_error && continued.limit == 7,
+            "Continue-on-error flag was not enabled or consumed the next option");
 }
 
 void test_ranking_compatibility() {
@@ -173,6 +177,9 @@ void test_invalid_arguments() {
         {"--ranking", "hybrid", "--hybrid-lambda", "1.01"}, {"--ranking", "hybrid", "--hybrid-lambda", "-1"},
         {"--ranking", "hybrid", "--hybrid-lambda", "inf"}, {"--diagnostics", "1"},
         {"--top-k", "2", "--top-k", "3"}, {"--timings", "--timings"},
+        {"--continue-on-error", "--continue-on-error"}, {"--continue-on-error", "true"},
+        {"--continue-on-error", "--reference-mol2", "missing/references.mol2"},
+        {"--reference-mol2", "missing/references.mol2", "--continue-on-error"},
         {"--min-target-clearance", "off", "--min-target-clearance", "0"},
         {"--rescoring-backend"}, {"--rescoring-backend", ""},
         {"--rescoring-backend", "gpu"}, {"--rescoring-backend", "CUDA"},
@@ -255,7 +262,8 @@ int main() {
         write_gpu_docking_usage(usage);
         require(usage.str().find("vinardo-rep50") != std::string::npos &&
                 usage.str().find("--min-target-clearance") != std::string::npos &&
-                usage.str().find("--rescoring-backend") != std::string::npos,
+                usage.str().find("--rescoring-backend") != std::string::npos &&
+                usage.str().find("--continue-on-error") != std::string::npos,
                 "Usage omits supported settings");
         std::cout << "GPU docking configuration tests passed\n";
         return 0;

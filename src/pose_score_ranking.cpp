@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -115,8 +116,10 @@ double vinardo_adjusted_score(const VinardoLikeScore& terms, double alpha)
 std::vector<RankedPoseScore> rank_rescored_poses(
     const PoseRescoringResult& input,
     const PoseScoreRankingOptions& options,
-    std::size_t top_k)
+    std::size_t top_k,
+    double* hybrid_normalization_seconds)
 {
+    if (hybrid_normalization_seconds) *hybrid_normalization_seconds = 0.0;
     if (top_k == 0) throw std::invalid_argument("Top-k must be positive");
     // Validate the enum even for a pool with no rows.
     pose_score_method_name(options.method);
@@ -148,6 +151,8 @@ std::vector<RankedPoseScore> rank_rescored_poses(
         }
     }
     if (hybrid) {
+        const auto normalization_start = hybrid_normalization_seconds
+            ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto weighted_interaction_z = population_zscores(weighted_interaction_values);
         const auto vinardo_z = population_zscores(vinardo_rewards);
         hybrid_values.reserve(input.poses.size());
@@ -157,6 +162,9 @@ std::vector<RankedPoseScore> rank_rescored_poses(
             require_finite(score, "Hybrid");
             hybrid_values.push_back(score);
         }
+        if (hybrid_normalization_seconds)
+            *hybrid_normalization_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - normalization_start).count();
     }
 
     std::vector<PoseScoreEntry> entries;

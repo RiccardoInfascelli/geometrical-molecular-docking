@@ -10,6 +10,7 @@
 #include "gpu_pose_search.hpp"
 #include "pose_rescoring.hpp"
 #include "stage_profile.hpp"
+#include "cuda_triplet_index.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -58,6 +59,7 @@ struct Options {
     std::optional<std::size_t> rescore_prefilter;
     bool interaction_full_protein = false;
     bool profile = false;
+    int query_threads = 1;
 };
 
 Options parse_args(int argc, char** argv) {
@@ -70,6 +72,7 @@ Options parse_args(int argc, char** argv) {
     }
     Options opts;
     opts.profile = stage_profiling_enabled();
+    opts.query_threads = gpu_query_requested_threads();
     bool rescore_options_given = false;
     opts.target_complex = argv[1];
     opts.mol2 = argv[2];
@@ -159,7 +162,8 @@ void write_header(std::ofstream& csv) {
            "matching_areas,diameter_A,ligand_triplets,protein_index_mode,"
            "protein_triplet_records,candidate_matches,transforms_generated,"
            "survivors,best_fast_score,ligand_prep_s,pose_search_s,score_s,"
-           "total_ligand_s,valid_transforms\n";
+           "total_ligand_s,valid_transforms,query_preparation_s,gpu_search_s,"
+           "query_threads_requested,query_threads_used\n";
 }
 
 void process_one(std::unique_ptr<RDKit::RWMol> molecule,
@@ -176,6 +180,9 @@ void process_one(std::unique_ptr<RDKit::RWMol> molecule,
     double diameter = 0.0, prep_s = 0.0, poses_s = 0.0;
     double best_fast_score = 0.0;
     bool has_score = false;
+    bool has_search_timings = false;
+    double query_s = 0.0, gpu_search_s = 0.0;
+    int query_threads_used = 1;
     std::string status = "ok", error;
     constexpr const char* mode = "shared";
     StageProfile stages;
@@ -199,7 +206,11 @@ void process_one(std::unique_ptr<RDKit::RWMol> molecule,
                 protein_records = fixed.index_records;
                 auto search = run_gpu_ligand_search(*molecule, ligand, fixed, config,
                     opts.profile ? &stages : nullptr,
-                    (rescore_target || opts.profile) ? &download_times : nullptr);
+                    (rescore_target || opts.profile) ? &download_times : nullptr, nullptr, true);
+                query_s = search.query_preparation_seconds;
+                gpu_search_s = seconds_since(pose_start) - query_s;
+                query_threads_used = search.query_threads_used;
+                has_search_timings = true;
                 matches = search.candidate_matches;
                 transforms = search.alignments;
                 pose_result = std::move(search.pipeline);
@@ -296,7 +307,11 @@ void process_one(std::unique_ptr<RDKit::RWMol> molecule,
     if (has_score) csv << best_fast_score;
     // Scoring is included in cuda_run_pose_pipeline, i.e. in pose_search_s.
     csv << ',' << prep_s << ',' << poses_s << ",,"
-        << total_s << ',' << valid_transforms << '\n';
+        << total_s << ',' << valid_transforms << ',';
+    if (has_search_timings) csv << query_s;
+    csv << ',';
+    if (has_search_timings) csv << gpu_search_s;
+    csv << ',' << opts.query_threads << ',' << query_threads_used << '\n';
     csv.flush();
     if (opts.profile) {
         double measured_search_ms = 0.0;
@@ -429,6 +444,12 @@ int main(int argc, char** argv) {
                   << "sum_ligand_s=" << ligand_seconds << '\n'
                   << "wall_total_s=" << seconds_since(all_start) << '\n'
                   << "results_csv=" << opts.output_csv << '\n';
+        std::cout << "query_threads_requested=" << opts.query_threads << '\n'
+                  << "query_openmp_available=" << gpu_query_openmp_available() << '\n'
+                  << "query_parallel_min_triplets=" << gpu_query_parallel_min_triplets << '\n'
+                  << "query_min_triplets_per_requested_thread=" << gpu_query_min_per_thread << '\n'
+                  << "gpu_search_scope=completed search excluding query preparation; includes host packing, copies and CUDA waits\n"
+                  << "cpu_gpu_overlap=off\n";
         // Additional startup metadata stays outside the ligand CSV and its timers.
         write_target_pruning_summary(std::cout, fixed, opts.min_target_clearance, '=');
         return failed ? 1 : 0;

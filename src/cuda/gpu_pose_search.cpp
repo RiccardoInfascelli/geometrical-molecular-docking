@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -119,8 +120,9 @@ GpuLigandSearchResult run_gpu_ligand_search(
     const RDKit::ROMol& molecule, const PreparedLigand& ligand,
     const PreparedGpuTarget& target, const RunConfig& config,
     StageProfile* stages, GpuPosePipelineTimings* download_timings,
-    GpuPosePipelineDeviceResult* device_result) {
+    GpuPosePipelineDeviceResult* device_result, bool collect_query_timings) {
     GpuLigandSearchResult result;
+    result.query_threads_requested = gpu_query_requested_threads();
     if (device_result) device_result->clear();
     std::size_t completed_valid_transforms = 0;
     std::size_t completed_survivors = 0;
@@ -147,10 +149,14 @@ GpuLigandSearchResult run_gpu_ligand_search(
         LigandDeviceBuffers device;
         std::vector<GpuTripletKey> queries;
         std::vector<GpuLigandTripletOrders> orders;
-        const auto query_start = stages ? Clock::now() : Clock::time_point{};
-        make_gpu_ligand_triplet_queries(ligand.triplets, config.triplet_bin_size, queries, orders);
+        const bool time_queries = stages || collect_query_timings;
+        const auto query_start = time_queries ? Clock::now() : Clock::time_point{};
+        GpuQueryPreparationInfo query_info;
+        make_gpu_ligand_triplet_queries(ligand.triplets, config.triplet_bin_size, queries, orders, &query_info);
+        result.query_threads_used = query_info.used_threads;
+        if (time_queries) result.query_preparation_seconds = seconds_since(query_start);
         if (stages)
-            stages->push_back({"query_preparation", seconds_since(query_start) * 1000.0,
+            stages->push_back({"query_preparation", result.query_preparation_seconds * 1000.0,
                                queries.size(), "observed_host_queries"});
         if (queries.size() != orders.size())
             throw std::runtime_error("GPU query/order mismatch");
@@ -205,6 +211,8 @@ GpuLigandSearchResult run_gpu_ligand_search(
             result.alignments != result.pipeline.input_alignment_count)
             throw std::runtime_error("GPU output count mismatch");
         require_cuda(cudaDeviceSynchronize() == cudaSuccess, "end of ligand synchronization");
+    } catch (const std::bad_alloc&) {
+        throw; // Resource exhaustion is fatal, not a recoverable ligand error.
     } catch (const std::exception& exception) {
         throw GpuLigandSearchError(exception.what(), result.candidate_matches, result.alignments,
                                   completed_valid_transforms, completed_survivors);

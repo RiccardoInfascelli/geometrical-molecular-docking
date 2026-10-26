@@ -111,6 +111,17 @@ void test_population_normalization_and_endpoints()
     close(*ranked[1].hybrid, -0.3);
     close(*rank_rescored_poses(two, {PoseScoreMethod::Hybrid, 1.0, 0.3}, 1)[0].hybrid, 0.3);
 
+    double normalization_seconds = -1.0;
+    const auto timed = rank_rescored_poses(two, {PoseScoreMethod::Hybrid, 1.0, 0.3}, 2,
+                                         &normalization_seconds);
+    require(ids(timed) == ids(ranked), "Timing changed Hybrid order");
+    for (std::size_t i = 0; i < ranked.size(); ++i)
+        require(timed[i].hybrid == ranked[i].hybrid, "Timing changed Hybrid values");
+    require(std::isfinite(normalization_seconds) && normalization_seconds >= 0.0,
+            "Missing Hybrid normalization interval");
+    rank_rescored_poses(two, {PoseScoreMethod::WeightedInteraction}, 2, &normalization_seconds);
+    require(normalization_seconds == 0.0, "Non-Hybrid ranking reported normalization time");
+
     const auto tied = pool({row(9, 3, 4, -1), row(1, 3, 4, -1)});
     for (const auto method : {PoseScoreMethod::Fast, PoseScoreMethod::WeightedInteraction,
                               PoseScoreMethod::Vinardo, PoseScoreMethod::Hybrid}) {

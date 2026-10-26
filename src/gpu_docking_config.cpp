@@ -78,6 +78,7 @@ GpuDockingCliOptions parse_gpu_docking_options(int argc, char** argv) {
         if (!seen.insert(flag).second)
             throw std::invalid_argument("Duplicate option: " + flag);
         if (flag == "--timings") { result.settings.collect_timings = true; continue; }
+        if (flag == "--continue-on-error") { result.continue_on_error = true; continue; }
         if (flag != "--top-k" && flag != "--limit" && flag != "--cutoff" &&
             flag != "--reference-mol2" && flag != "--ranking" && flag != "--kabsch" &&
             flag != "--query-method" && flag != "--clash-threshold" &&
@@ -154,6 +155,8 @@ GpuDockingCliOptions parse_gpu_docking_options(int argc, char** argv) {
             result.diagnostics_source = "cli";
         }
     }
+    if (result.continue_on_error && !result.references.empty())
+        throw std::invalid_argument("--continue-on-error cannot be combined with --reference-mol2");
     // Explicit scorer options are rejected for unrelated methods, even at default values.
     const auto method = result.settings.ranking.method;
     if (method == PoseScoreMethod::Fast && result.settings.fast_prefilter)
@@ -215,10 +218,14 @@ void write_gpu_docking_usage(std::ostream& output) {
         "  --hybrid-lambda FRACTION       Hybrid WeightedInteraction weight in [0,1] (default 0.3)\n"
         "  --rescoring-backend cpu|cuda   WeightedInteraction/Vinardo/Hybrid computation (default cpu)\n"
         "  --timings                     Write completed host wall intervals\n"
+        "  --continue-on-error           Record parse/dock failures and continue; exit nonzero on errors\n"
         "  --diagnostics off|stages      Stage diagnostics (default off)\n"
         "  --reference-mol2 FILE         Optional records paired by position and atom order\n"
         "CLI selectors override DOCKING_KABSCH_METHOD, DOCKING_QUERY_METHOD and\n"
         "DOCKING_PROFILE_STAGES. Only the exact environment value 1 enables stages.\n"
+        "DOCKING_QUERY_THREADS is a positive integer (default 1); values above 1 require\n"
+        "an ENABLE_OPENMP build and enough triplets; actual threads are in timings.csv.\n"
+        "--continue-on-error excludes --reference-mol2; output/CUDA state failures stop the run.\n"
         "Kabsch/query environment values must be canonical unless overridden by CLI;\n"
         "unrecognized Kabsch values are errors here, unlike the legacy SVD fallback.\n"
         "Protein, pocket, ligand and references must use the same coordinate frame.\n"

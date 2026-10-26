@@ -73,6 +73,13 @@ Defaults are Fast ranking, no record limit, a 24 Å shared triplet cutoff and SV
 Use `--cutoff A` to change the cutoff or `--kabsch quaternion` to select quaternion alignment.
 The example above overrides the ranking and rescoring defaults.
 
+Host query preparation stays serial unless `DOCKING_QUERY_THREADS=N` requests more threads in
+an `ENABLE_OPENMP=ON` build. Small inputs still run serially; timing output records actual usage.
+For long libraries, `gpu_docking --continue-on-error` records molecular errors and proceeds in input
+order; it returns a nonzero exit status if any record failed. This option cannot be combined with
+`--reference-mol2`. See the [OpenMP experiment](../experiments/openmp_queries/README.md) for the
+thread-count comparison, timing boundaries and completed-run error handling.
+
 ## Multi-ligand screening
 
 Both screeners report the best Fast score per ligand, rather than a full rescored ranking.
