@@ -80,18 +80,54 @@ GpuDockingCliOptions parse_gpu_docking_options(int argc, char** argv) {
         if (flag == "--timings") { result.settings.collect_timings = true; continue; }
         if (flag == "--continue-on-error") { result.continue_on_error = true; continue; }
         if (flag == "--no-sdf") { result.no_sdf = true; continue; }
+        if (flag == "--overlap-trace") { result.overlap_trace = true; continue; }
         if (flag != "--top-k" && flag != "--limit" && flag != "--cutoff" &&
             flag != "--reference-mol2" && flag != "--ranking" && flag != "--kabsch" &&
             flag != "--query-method" && flag != "--clash-threshold" &&
             flag != "--min-target-clearance" && flag != "--interaction-region" &&
             flag != "--fast-prefilter" && flag != "--vinardo-alpha" &&
-            flag != "--hybrid-lambda" && flag != "--diagnostics" && flag != "--rescoring-backend")
+            flag != "--hybrid-lambda" && flag != "--diagnostics" && flag != "--rescoring-backend" &&
+            flag != "--pose-output" && flag != "--pose-detail" && flag != "--cpu-gpu-overlap" &&
+            flag != "--gpu-batch" && flag != "--batch-size" && flag != "--batch-memory-mib" &&
+            flag != "--pose-center-distance" && flag != "--center-reference-mol2")
             throw std::invalid_argument("Unknown option: " + flag);
         if (++i >= argc || !argv[i] || !*argv[i] || std::string(argv[i]).starts_with("--"))
             throw std::invalid_argument("Missing value for " + flag);
         const std::string value = argv[i];
-        if (flag == "--top-k") result.top_k = positive_integer(value, flag);
-        else if (flag == "--limit") result.limit = positive_integer(value, flag);
+        if (flag == "--top-k") {
+            result.top_k = positive_integer(value, flag);
+            result.pose_export.top_k = result.top_k;
+        } else if (flag == "--pose-output") {
+            result.pose_export.mode = parse_pose_export_mode(value);
+            result.pose_output_controls = true;
+        } else if (flag == "--pose-detail") {
+            result.pose_export.detail = parse_pose_export_detail(value);
+            result.pose_output_controls = true;
+        } else if (flag == "--pose-center-distance") {
+            if (value != "off" && value != "on")
+                throw std::invalid_argument("--pose-center-distance must be off or on");
+            result.pose_center_distance = value == "on";
+        } else if (flag == "--center-reference-mol2") {
+            result.center_reference = value;
+        } else if (flag == "--cpu-gpu-overlap") {
+            if (value != "off" && value != "on")
+                throw std::invalid_argument("--cpu-gpu-overlap must be off or on");
+            result.cpu_gpu_overlap = value == "on";
+        } else if (flag == "--gpu-batch") {
+            if (value != "off" && value != "on")
+                throw std::invalid_argument("--gpu-batch must be off or on");
+            result.gpu_batch = value == "on";
+        } else if (flag == "--batch-size") {
+            result.batch_size = positive_integer(value, flag);
+            if (result.batch_size > 64)
+                throw std::invalid_argument("--batch-size must be at most 64");
+        } else if (flag == "--batch-memory-mib") {
+            const auto mib = positive_integer(value, flag);
+            constexpr std::size_t bytes_per_mib = 1024 * 1024;
+            if (mib > std::numeric_limits<std::size_t>::max() / bytes_per_mib)
+                throw std::invalid_argument("--batch-memory-mib exceeds addressable capacity");
+            result.batch_memory_bytes = mib * bytes_per_mib;
+        } else if (flag == "--limit") result.limit = positive_integer(value, flag);
         else if (flag == "--reference-mol2") result.references = value;
         else if (flag == "--cutoff") {
             result.settings.cutoff = finite_number(value, flag);
@@ -158,6 +194,8 @@ GpuDockingCliOptions parse_gpu_docking_options(int argc, char** argv) {
     }
     if (result.continue_on_error && !result.references.empty())
         throw std::invalid_argument("--continue-on-error cannot be combined with --reference-mol2");
+    if (result.pose_center_distance && result.center_reference.empty() && result.references.empty())
+        throw std::invalid_argument("--pose-center-distance on requires --center-reference-mol2 or --reference-mol2");
     // Explicit scorer options are rejected for unrelated methods, even at default values.
     const auto method = result.settings.ranking.method;
     if (method == PoseScoreMethod::Fast && result.settings.fast_prefilter)
@@ -176,13 +214,13 @@ GpuDockingCliOptions parse_gpu_docking_options(int argc, char** argv) {
     // Consult environment selectors only when no CLI value was supplied.
     if (result.kabsch_source.empty()) {
         const char* environment = std::getenv("DOCKING_KABSCH_METHOD");
-        result.kabsch_method = environment ? environment : "svd";
+        result.kabsch_method = environment ? environment : "quaternion";
         result.kabsch_source = environment ? "environment" : "default";
         validate_kabsch(result.kabsch_method, "DOCKING_KABSCH_METHOD");
     }
     if (result.query_source.empty()) {
         const char* environment = std::getenv("DOCKING_QUERY_METHOD");
-        result.query_method = environment ? environment : "reference";
+        result.query_method = environment ? environment : "optimized";
         result.query_source = environment ? "environment" : "default";
         validate_query(result.query_method, "DOCKING_QUERY_METHOD");
     }
@@ -190,6 +228,38 @@ GpuDockingCliOptions parse_gpu_docking_options(int argc, char** argv) {
         const char* environment = std::getenv("DOCKING_PROFILE_STAGES");
         result.settings.diagnostic_stages = environment && std::strcmp(environment, "1") == 0;
         result.diagnostics_source = environment ? "environment" : "default";
+    }
+    if (!result.gpu_batch && (seen.contains("--batch-size") || seen.contains("--batch-memory-mib")))
+        throw std::invalid_argument("Batch size and memory controls require --gpu-batch on");
+    if (result.gpu_batch) {
+        if (method != PoseScoreMethod::Fast &&
+            result.settings.rescoring_backend != GpuRescoringBackend::Cuda)
+            throw std::invalid_argument("GPU batch requires --rescoring-backend cuda for rescoring rankings");
+        if (result.kabsch_method != "quaternion")
+            throw std::invalid_argument("GPU batch requires --kabsch quaternion");
+        if (result.settings.diagnostic_stages)
+            throw std::invalid_argument("GPU batch does not support per-ligand stage profiling");
+        for (const char* key : {"DOCKING_STAGE_TIMINGS", "DOCKING_KABSCH_TIMINGS"})
+            if (std::getenv(key))
+                throw std::invalid_argument(std::string("Unset ") + key + " before GPU batch docking");
+    }
+    if (result.overlap_trace && !result.cpu_gpu_overlap.has_value())
+        throw std::invalid_argument("--overlap-trace requires explicit --cpu-gpu-overlap off|on");
+    if (result.cpu_gpu_overlap.has_value()) {
+        if (!result.references.empty())
+            throw std::invalid_argument("CPU/GPU overlap does not support paired references");
+        if (method != PoseScoreMethod::Fast &&
+            result.settings.rescoring_backend != GpuRescoringBackend::Cuda)
+            throw std::invalid_argument("CPU/GPU overlap requires --rescoring-backend cuda for rescoring rankings");
+        if (!result.no_sdf && result.pose_export.mode != PoseExportMode::None)
+            throw std::invalid_argument("The overlap experiment requires --no-sdf or --pose-output none");
+        if (result.kabsch_method != "quaternion")
+            throw std::invalid_argument("The overlap experiment requires --kabsch quaternion");
+        if (result.settings.diagnostic_stages || !result.settings.collect_timings)
+            throw std::invalid_argument("The overlap experiment requires --timings and --diagnostics off");
+        for (const char* key : {"DOCKING_STAGE_TIMINGS", "DOCKING_KABSCH_TIMINGS"})
+            if (std::getenv(key))
+                throw std::invalid_argument(std::string("Unset ") + key + " before the overlap experiment");
     }
     return result;
 }
@@ -206,11 +276,13 @@ void apply_gpu_docking_environment(const GpuDockingCliOptions& options) {
 void write_gpu_docking_usage(std::ostream& output) {
     output << "Usage: gpu_docking <protein.pdb> <pocket.pdb> <ligands.mol2> <new-output-directory>\n"
         "  --top-k K                     Poses per ligand (default 20)\n"
+        "  --pose-output none|topk|all    Pose export policy (default topk; not a scoring prefilter)\n"
+        "  --pose-detail compact|full    CSV fields (default original full schema)\n"
         "  --limit N                     First N records (default all)\n"
         "  --cutoff A                    Shared triplet cutoff, positive (default 24)\n"
         "  --ranking METHOD              fast|weighted-interaction|vinardo|vinardo-rep50|hybrid (default fast)\n"
-        "  --kabsch METHOD               svd|quaternion (default svd)\n"
-        "  --query-method METHOD         reference|optimized (default reference)\n"
+        "  --kabsch METHOD               svd|quaternion (default quaternion)\n"
+        "  --query-method METHOD         reference|optimized (default optimized)\n"
         "  --clash-threshold FRACTION    Fraction in [0,1] (default 0.05)\n"
         "  --min-target-clearance off|A  Optional non-negative target filter (default off; 0 is active)\n"
         "  --interaction-region pocket|protein WeightedInteraction/Hybrid target region (default pocket)\n"
@@ -220,9 +292,16 @@ void write_gpu_docking_usage(std::ostream& output) {
         "  --rescoring-backend cpu|cuda   WeightedInteraction/Vinardo/Hybrid computation (default cpu)\n"
         "  --timings                     Write completed host wall intervals\n"
         "  --no-sdf                      Export CSV only; do not serialize pose structures\n"
+        "  --cpu-gpu-overlap off|on      Bounded CPU preparation, including multi-batch prefetch; requires quaternion, timings and CUDA rescoring for non-Fast rankings\n"
+        "  --overlap-trace               Optional NVTX ranges for a separate Nsight capture\n"
+        "  --gpu-batch off|on            Aggregate CUDA search/scoring; requires quaternion and CUDA rescoring for non-Fast rankings (default off)\n"
+        "  --batch-size N               Input records per GPU batch, 1..64 (default 16; requires batch on)\n"
+        "  --batch-memory-mib N         Explicit buffer/scratch budget, not total VRAM; excludes receptor, query/scan and library-internal allocations (default 2048)\n"
         "  --continue-on-error           Record molecular failures and continue; exit nonzero on errors\n"
         "  --diagnostics off|stages      Stage diagnostics (default off)\n"
         "  --reference-mol2 FILE         Optional records paired by position and atom order\n"
+        "  --pose-center-distance off|on Export heavy-atom centroid distance after ranking (default off)\n"
+        "  --center-reference-mol2 FILE  Single shared centroid reference; no ligand atom mapping required\n"
         "CLI selectors override DOCKING_KABSCH_METHOD, DOCKING_QUERY_METHOD and\n"
         "DOCKING_PROFILE_STAGES. Only the exact environment value 1 enables stages.\n"
         "DOCKING_QUERY_THREADS is a positive integer (default 1); values above 1 require\n"
@@ -231,5 +310,7 @@ void write_gpu_docking_usage(std::ostream& output) {
         "Kabsch/query environment values must be canonical unless overridden by CLI;\n"
         "unrecognized Kabsch values are errors here, unlike the legacy SVD fallback.\n"
         "Protein, pocket, ligand and references must use the same coordinate frame.\n"
-        "RMSD never participates in ranking; it is calculated only for exported poses.\n";
+        "RMSD never participates in ranking. With explicit pose output controls and a\n"
+        "reference, pose_metrics.csv covers the complete ranked post-prefilter pool;\n"
+        "otherwise RMSD is calculated only for exported poses.\n";
 }

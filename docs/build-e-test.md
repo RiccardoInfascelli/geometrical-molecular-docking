@@ -15,10 +15,12 @@ The project and preset format require CMake 3.20 or newer, but the current
 `chem-interactions` checkout explicitly sets `CMP0167 NEW`, making **CMake
 3.30 or newer** necessary. The build files do not specify minimum versions
 for Eigen3, Boost, RDKit or the CUDA toolkit.
+Use a compatible dependency checkout and record its Git revision alongside the
+engine revision when reproducing a build.
 
 Python 3 is optional for the main build and enables additional Python tests.
-Python RDKit is not required by the engine; it is needed for conformer generation
-in the separate experimental suite.
+The engine and the C++ `ligand_conformer_docking` suite do not require Python
+RDKit; the older `conformer_ensemble` Python workflow does.
 
 ## CMake organization and options
 
@@ -29,14 +31,16 @@ libraries. Applications, tests and root-project experiments link these libraries
 | Option | Default | Purpose |
 | --- | --- | --- |
 | `ENABLE_CUDA` | `OFF` | Build the CUDA backend, GPU applications and applicable tests/experiments. |
+| `ENABLE_OPENMP` | `OFF` | Enable optional host query parallelism; requires compiler support for OpenMP. |
 | `BUILD_TESTING` | `ON` | Build test executables and enable CTest registration. |
 | `BUILD_EXPERIMENTS` | `ON` | Build the root project's diagnostic, reference and experimental tools. |
 | `DOCKING_TEST_COMPLEX` | Empty | Register real-data integration cases when CUDA and testing are enabled; set to a complex directory. |
 | `TARGET_CPU_ARCHITECTURE` | `generic` | Dependency option controlling architecture flags on applicable Release C++ targets; both presets retain `generic`. |
 | `CMAKE_CUDA_ARCHITECTURES` | `80` in the CUDA preset | Select the CUDA target architecture; 80 targets NVIDIA A100. |
 
-The autonomous `scoring_ablation` and `conformer_ensemble` suites have separate
-CMake builds. They are not included by `BUILD_EXPERIMENTS`; see the
+The autonomous `scoring_ablation`, `conformer_ensemble` and
+`ligand_conformer_docking` suites have separate CMake builds.
+They are not included by `BUILD_EXPERIMENTS`; see the
 [experiments guide](../experiments/README.md).
 
 ## CPU Release
@@ -70,6 +74,9 @@ cmake --preset cuda-release -DCMAKE_CUDA_ARCHITECTURES=<architecture>
 ```
 
 Replace `<architecture>` with the appropriate compute-capability value.
+Optional host query parallelism requires OpenMP at configuration time, for
+example `cmake --preset cuda-release -DENABLE_OPENMP=ON`. Runtime query
+preparation still defaults to one thread; `DOCKING_QUERY_THREADS` selects more.
 Both build presets use one job to limit compilation memory; this does not
 restrict runtime CPU/CUDA parallelism. Executables are placed in the selected
 build directory. A specific target can be built with
@@ -101,5 +108,7 @@ ctest --preset cuda-release
 The CUDA suite includes host tests and requires an NVIDIA GPU for device checks.
 Real-data integration tests are opt-in through the CMake cache variable
 `DOCKING_TEST_COMPLEX`; a shell variable alone does not register them.
+For example, configure with
+`cmake --preset cuda-release -DDOCKING_TEST_COMPLEX=/path/to/1a1e` before building.
 See the [test guide](../tests/README.md) for prerequisites, registration,
 selection commands and numerical comparison protocols.

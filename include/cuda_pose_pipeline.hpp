@@ -66,6 +66,8 @@ struct GpuPosePipelineTimings
 // survive; the collect_stages request is retained.
 // False reports invalid arguments or CUDA failure; partial counters are not a
 // completed search result and must not be used as scientific output.
+// Optional compaction scratch is borrowed; it never owns returned survivors and
+// must be used on the same device without concurrent pipeline calls.
 bool cuda_run_pose_pipeline(
     const GpuPointArrayDevice& ligand_matching_points,
     const GpuPointArrayDevice& protein_target_points,
@@ -76,7 +78,8 @@ bool cuda_run_pose_pipeline(
     double clash_threshold,
     GpuPosePipelineResult& result,
     GpuPosePipelineTimings* timings = nullptr,
-    GpuPosePipelineDeviceResult* device_result = nullptr
+    GpuPosePipelineDeviceResult* device_result = nullptr,
+    GpuClashCompactionWorkspace* compaction_workspace = nullptr
 );
 
 
@@ -90,7 +93,8 @@ bool cuda_run_pose_pipeline(
     const std::vector<GpuAlignmentCandidate>& alignments,
     double clash_threshold,
     GpuPosePipelineResult& result,
-    GpuPosePipelineTimings* timings = nullptr
+    GpuPosePipelineTimings* timings = nullptr,
+    GpuClashCompactionWorkspace* compaction_workspace = nullptr
 );
 
 

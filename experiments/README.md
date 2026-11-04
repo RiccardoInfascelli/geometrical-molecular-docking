@@ -26,21 +26,25 @@ specific choices; WIP features still require build and numerical verification.
 | Geometry | [`protein_index_cutoff_bench`](geometry/protein_index_cutoff_bench.cpp) | Measure CPU hash-index construction, record counts and host-memory estimates for one cutoff. | Diagnostic profiling; no pose search or VRAM measurement. |
 | Profiling | [`offline_profile_experiment`](profiling/offline_profile_experiment_main.cpp) | Time protein/pocket loading, area extraction, grid construction and target generation separately. | Diagnostic; excludes the online docking phase. |
 | Profiling | [`OpenMP queries`](openmp_queries/README.md) | Measure host query preparation and compare thread counts across the four GPU ranking modes. | Synthetic microbenchmark and campaign runner; A100 throughput must be measured separately. |
+| Profiling | [`CPU–GPU overlap`](cpu_gpu_overlap/README.md) | Compare sequential and prefetched ligand preparation with one CUDA consumer. | Operational runner; host intervals alone do not prove kernel overlap. |
 | Molecular analysis | [`ligand_diameter_stats`](analysis/ligand_diameter_stats.cpp) | Describe interaction-area diameters in a complex collection or sampled multi-record MOL2 file; export CSV and summary. | Operational analysis; no docking. |
 | Molecular analysis | [`crystal_affinity_interactions`](analysis/crystal_affinity_interactions.cpp) | Export crystal-pose chemical interaction counts and PDBbind Kd/Ki records for affinity analysis. | Exploratory; does not evaluate predicted poses. |
 | Scoring | [`vinardo_rescore_experiment`](scoring/vinardo_rescore_experiment.cpp) | Compare scores on either a historical Fast top-N pool or a declared joint Fast/WeightedInteraction/Vinardo-like pool. | Operational export; protocols differ below. |
-| Scoring | [`scoring_ablation`](scoring_ablation/README.md) | Replay saved transforms on a fixed pool and measure ranking changes after removing one WeightedInteraction family or Vinardo term. | Exploratory, standalone CPU suite. |
+| Scoring | [`scoring_ablation`](scoring_ablation/README.md) | Replay saved transforms on a fixed pool and measure ranking changes after removing one WeightedInteraction family or Vinardo term. | Standalone CPU suite; scientific workflow remains WIP. |
 | Serial reference | [`serial_docking`](reference/serial_main.cpp) | Retain a CPU hash-index Fast→WeightedInteraction reference with its own orchestration, Top-20 report and timings. | Operational reference; not an alias of the main pipeline. |
 | CUDA screening | [`multi_ligand_screen_gpu_batch`](screening_batch/multi_ligand_screen_gpu_batch.cpp) | Compare warp/block/multi-block ligand scheduling using counts, Fast Top-1 and throughput. | Exploratory; quaternion only, no WeightedInteraction/Hybrid rescoring. |
-| Conformers | [`conformer_ensemble`](conformer_ensemble/README.md) | Generate ETKDGv3/MMFF94 conformers, dock each and replay a saved pool for global Hybrid ranking. | WIP, especially the global Hybrid extension. |
+| Conformers | [`ligand_conformer_docking`](ligand_conformer_docking/README.md) | Generate ETKDGv3 conformers, reuse a CUDA receptor and rank the combined pose pool. | Operational standalone C++ suite; optional MMFF94. |
+| Conformer quality | [`conformer_quality`](ligand_conformer_docking/README-conformer-quality.md) | Measure conformational coverage with prefix budgets and aligned heavy-atom RMSD. | Operational CPU-only experiment; no docking. |
+| Conformers | [`conformer_ensemble`](conformer_ensemble/README.md) | Generate conformers in Python, dock each and replay a saved pool for global Hybrid ranking. | Older workflow; global Hybrid extension remains WIP. |
 
 ## Build and Usage
 
 The root presets `cpu-release` and `cuda-release` both enable
-`BUILD_EXPERIMENTS=ON`. They build the listed standalone programs except the
-two autonomous suites: `scoring_ablation` and `conformer_ensemble` have their own
-CMake configurations and reuse the engine's host libraries. The batch screener
-additionally requires `ENABLE_CUDA=ON` and a compatible NVIDIA GPU.
+`BUILD_EXPERIMENTS=ON`. The C++ programs above use the root build except for
+`scoring_ablation`, `conformer_ensemble` and `ligand_conformer_docking`
+(including `conformer_quality`), which have separate CMake configurations.
+The profiling runners invoke existing engine targets. CUDA programs require
+`ENABLE_CUDA=ON` and a compatible NVIDIA GPU.
 
 After configuring the appropriate preset as described in the
 [main build instructions](../README.md#build), individual targets can be built:
@@ -80,23 +84,32 @@ differs from threshold zero, which still removes negative-clearance targets.
 Joint scoring writes `poses.csv` and `protocol.csv`. It has no Fast prefilter by
 default; add `--prefilter N` to restrict the pool. The separate positional mode
 `vinardo_rescore_experiment COMPLEX N output.csv` retains the historical Fast
-top-N experiment and Vinardo ranking. Joint export preserves generation order
-and does not itself compute Hybrid. WeightedInteraction uses pocket areas by default
+top-N experiment and Vinardo ranking. Without `--diagnostics`, joint export
+preserves generation order without computing rankings. `--diagnostics` adds
+Full/Fast Top-500 analysis with five rankings, direct heavy-atom RMSD and centroid
+metrics; it cannot be combined with `--prefilter`.
+WeightedInteraction uses pocket areas by default
 (`--interaction-region protein` selects all areas); Vinardo always uses the full
 supported protein with its atomic cutoff.
 
 CUDA batch output is `records.csv`, `batches.csv` and `summary.csv`. Omit `--verify`
 for throughput measurements: verification adds baseline work to total wall time.
-Use the local READMEs for [scoring ablation](scoring_ablation/README.md) and
-[conformer ensembles](conformer_ensemble/README.md), including their separate
-builds, tests and Python/RDKit requirements. Root presets do not build those suites.
+This experimental scheduler is separate from the aggregated search and CUDA
+rescoring selected by `gpu_docking --gpu-batch on`; see the
+[batch guide](../docs/gpu-batch.md).
+Use the local READMEs for [scoring ablation](scoring_ablation/README.md),
+[CUDA ensemble docking](ligand_conformer_docking/README.md),
+[conformer quality](ligand_conformer_docking/README-conformer-quality.md) and the
+[older Python conformer workflow](conformer_ensemble/README.md) for their
+separate builds, tests and dependency requirements.
 
 ## Scientific scope
 
 Geometry diagnostics explain search behavior; timing experiments measure cost;
 accuracy studies require crystal references, a declared RMSD definition and a
 fixed evaluation protocol. Best available RMSD measures search coverage, not
-the accuracy of a score-selected Top-1. RMSD never serves as a ranking criterion.
+the accuracy of a score-selected Top-1. Energy rankings do not use RMSD; the
+conformer suite's explicit RMSD Oracle is a reference-based diagnostic.
 
 Do not assume identical candidate pools across tools. Serial and clearance
 experiments use a ligand-diameter index; joint scoring retains a diameter
@@ -106,15 +119,14 @@ tie-breaking before comparing results. WeightedInteraction ablation must recompu
 maximum per area; Hybrid normalization must be recomputed on the fixed pool.
 
 Target-shift and openness diagnostics use the known ligand and are not blind
-pocket-search methods. Crop experiments do not activate cropping in the engine.
+pocket-search methods. `pocket_area_experiment` compares extraction regions;
+engine cropping must be selected separately.
 The clash experiment sets an operational threshold of **1.0**, despite its
 stale **6%** banner; identify its protocol from the source parameters.
 
-The conformer suite, particularly global Hybrid rescoring, remains **WIP: not
-yet compiled and numerically validated**. Its intended normalization covers
-all generated-conformer survivors before local Top-K selection, with the
-crystallographic baseline kept separate. Existing source and prepared tests
-do not establish a validated accuracy result.
+The older Python `conformer_ensemble` workflow still has a WIP global Hybrid
+extension; it is separate from the C++ CUDA ensemble suite. Automated checks
+and small docking smoke tests do not establish dataset-wide accuracy.
 
 Save the command, build/version, configuration, input identity and outputs for
 each run in a new location. Preserve failures and empty pools as well as successes.

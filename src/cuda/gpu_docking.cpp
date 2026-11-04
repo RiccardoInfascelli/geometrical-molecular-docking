@@ -1,12 +1,17 @@
 #include "gpu_docking.hpp"
 
 #include "gpu_pose_search.hpp"
+#include "gpu_ligand_batch.hpp"
 #include "ligand_preparation.hpp"
 #include "pose_rescoring.hpp"
 #include "cuda_pose_rescoring.hpp"
+#include "cuda_ligand_batch_rescoring.hpp"
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <new>
 #include <stdexcept>
 #include <utility>
 
@@ -102,28 +107,122 @@ std::size_t GpuDockingScreen::vinardo_skipped_receptor_atoms() const {
 }
 
 GpuDockingResult GpuDockingScreen::dock(RDKit::RWMol& molecule, std::size_t k) {
+    return dock_impl(molecule, k, nullptr);
+}
+
+GpuDockingResult GpuDockingScreen::dock_prepared(GpuPreparedLigand& prepared, std::size_t k) {
+    if (!prepared.molecule) throw GpuQueryPreparationError("Prepared GPU packet has no molecule");
+    return dock_impl(*prepared.molecule, k, &prepared);
+}
+
+void GpuDockingScreen::release_batch_scratch() noexcept {
+    impl_->target->compaction_workspace.clear();
+}
+
+std::vector<GpuDockingResult> GpuDockingScreen::dock_batch_prepared(
+    const std::vector<GpuPreparedLigand*>& ligands, std::size_t k,
+    std::size_t max_device_bytes, GpuDockingBatchTimings* timings,
+    std::vector<std::exception_ptr>* record_errors) {
+    if (timings) *timings = {};
+    if (record_errors) record_errors->assign(ligands.size(), nullptr);
+    if (k == 0) throw std::invalid_argument("top-k must be positive");
+    const bool rescoring = impl_->settings.ranking.method != PoseScoreMethod::Fast;
+    if (rescoring && impl_->settings.rescoring_backend != GpuRescoringBackend::Cuda)
+        throw std::invalid_argument("GPU batch rescoring requires the CUDA backend");
+    const char* method = std::getenv("DOCKING_KABSCH_METHOD");
+    if (!method || std::strcmp(method, "quaternion") != 0)
+        throw std::invalid_argument("GPU batch requires quaternion Kabsch");
+    if (impl_->settings.diagnostic_stages)
+        throw std::invalid_argument("GPU batch does not support per-record stage diagnostics");
+
+    GpuLigandBatchSearchTimings batch;
+    GpuPosePipelineDeviceResult device_pool;
+    auto searches = run_gpu_ligand_batch_search(ligands, *impl_->target, impl_->config,
+        max_device_bytes, impl_->settings.collect_timings || timings ? &batch : nullptr,
+        rescoring ? &device_pool : nullptr);
+    if (timings) {
+        timings->search_seconds = impl_->settings.collect_timings ? batch.search_seconds : 0.0;
+        timings->explicit_device_bytes = batch.explicit_device_bytes;
+    }
+    std::vector<GpuDockingResult> results;
+    if (rescoring) {
+        const auto& scratch = impl_->target->compaction_workspace;
+        const auto scratch_bytes = scratch.capacity * 2 * sizeof(std::uint32_t) +
+            (scratch.valid_count ? sizeof(std::uint32_t) : 0) + scratch.scan_capacity_bytes;
+        const auto rescoring_start = start_timer(impl_->settings.collect_timings);
+        results = rescore_ligand_batch_cuda(device_pool, ligands, searches,
+            *impl_->device_rescoring_target, impl_->settings, k, max_device_bytes,
+            scratch_bytes, timings, record_errors);
+        if (timings) timings->rescoring_seconds = elapsed(rescoring_start, impl_->settings.collect_timings);
+    } else results.resize(ligands.size());
+    for (std::size_t i = 0; i < ligands.size(); ++i) {
+        auto& result = results[i];
+        const auto& prepared = *ligands[i];
+        const auto& search = searches[i];
+        result.diameter = prepared.ligand.diameter;
+        result.ligand_triplets = prepared.ligand.triplets.size();
+        result.candidate_matches = search.candidate_matches;
+        result.alignments = search.alignments;
+        result.valid_transforms = search.pipeline.valid_transform_count;
+        result.survivors = search.pipeline.clash_survivor_count;
+        if (!rescoring) result.candidate_pool = result.survivors;
+        const bool timed = impl_->settings.collect_timings;
+        result.timings.preparation_seconds = timed ? prepared.preparation_seconds : 0.0;
+        result.timings.query_preparation_seconds = timed ? prepared.query_preparation_seconds : 0.0;
+        result.timings.query_threads_requested = search.query_threads_requested;
+        result.timings.query_threads_used = search.query_threads_used;
+        if (rescoring) continue;
+        const auto start = start_timer(timed);
+        try {
+            result.poses = select_top_gpu_poses(search.pipeline.poses, k);
+        } catch (const std::bad_alloc&) {
+            throw;
+        } catch (const std::exception&) {
+            if (!record_errors) throw;
+            (*record_errors)[i] = std::current_exception();
+        }
+        result.timings.selection_seconds = elapsed(start, timed);
+    }
+    return results;
+}
+
+GpuDockingResult GpuDockingScreen::dock_impl(
+    RDKit::RWMol& molecule, std::size_t k, const GpuPreparedLigand* prepared) {
     if (k == 0) throw std::invalid_argument("top-k must be positive");
     GpuDockingResult output;
     const auto& settings = impl_->settings;
     const bool timed = settings.collect_timings;
     auto start = start_timer(timed);
-    PreparedLigand ligand;
-    prepare_ligand(molecule, ligand);
+    PreparedLigand local_ligand;
+    if (!prepared) prepare_ligand(molecule, local_ligand);
+    const auto& ligand = prepared ? prepared->ligand : local_ligand;
     output.diameter = ligand.diameter;
     output.ligand_triplets = ligand.triplets.size();
-    output.timings.preparation_seconds = elapsed(start, timed);
+    output.timings.preparation_seconds = prepared && timed
+        ? prepared->preparation_seconds : elapsed(start, timed);
 
     start = start_timer(timed);
     GpuPosePipelineDeviceResult device_pool;
     const bool device_rescoring = settings.ranking.method != PoseScoreMethod::Fast &&
                                  settings.rescoring_backend == GpuRescoringBackend::Cuda;
+    const bool record_completed_stages = prepared && timed && device_rescoring;
+    std::optional<GpuOverlapTraceRange> search_trace;
+    if (record_completed_stages && prepared->trace_enabled)
+        search_trace.emplace(true, "gpu_geometry_search");
     auto search = run_gpu_ligand_search(molecule, ligand, *impl_->target, impl_->config,
         settings.diagnostic_stages ? &output.stages : nullptr, nullptr,
-        device_rescoring ? &device_pool : nullptr, timed);
-    output.timings.search_seconds = elapsed(start, timed);
+        device_rescoring ? &device_pool : nullptr, timed, prepared);
+    search_trace.reset();
+    const auto geometry_end = record_completed_stages ? Clock::now() : Clock::time_point{};
+    const auto geometry_start = record_completed_stages ? start : Clock::time_point{};
+    const double completed_search_s = elapsed(start, timed);
+    // Prepared queries run on a different host thread. Preserve search_seconds
+    // as total search work (query + completed wrapper), not elapsed pipeline wall.
+    output.timings.search_seconds = timed && prepared
+        ? completed_search_s + search.query_preparation_seconds : completed_search_s;
     output.timings.query_preparation_seconds = timed ? search.query_preparation_seconds : 0.0;
     output.timings.gpu_search_seconds = timed
-        ? output.timings.search_seconds - search.query_preparation_seconds : 0.0;
+        ? (prepared ? completed_search_s : output.timings.search_seconds - search.query_preparation_seconds) : 0.0;
     output.timings.query_threads_requested = search.query_threads_requested;
     output.timings.query_threads_used = search.query_threads_used;
     output.candidate_matches = search.candidate_matches;
@@ -140,6 +239,10 @@ GpuDockingResult GpuDockingScreen::dock(RDKit::RWMol& molecule, std::size_t k) {
     }
 
     if (device_rescoring) {
+        const auto rescoring_start = record_completed_stages ? Clock::now() : Clock::time_point{};
+        std::optional<GpuOverlapTraceRange> rescoring_trace;
+        if (record_completed_stages && prepared->trace_enabled)
+            rescoring_trace.emplace(true, "gpu_rescoring_and_ranking");
         auto rescored = rescore_pose_pool_cuda(device_pool, molecule, ligand,
             *impl_->device_rescoring_target, settings, k);
         output.poses = std::move(rescored.poses);
@@ -158,6 +261,12 @@ GpuDockingResult GpuDockingScreen::dock(RDKit::RWMol& molecule, std::size_t k) {
         output.timings.gpu_search_seconds = gpu_s;
         output.timings.query_threads_requested = requested_threads;
         output.timings.query_threads_used = used_threads;
+        if (record_completed_stages) {
+            output.timings.geometry_start = geometry_start;
+            output.timings.geometry_end = geometry_end;
+            output.timings.rescoring_start = rescoring_start;
+            output.timings.rescoring_end = Clock::now();
+        }
         return output;
     }
 

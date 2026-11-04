@@ -2,6 +2,7 @@
 #define CUDA_VINARDO_SCORING_HPP
 
 #include "cuda_triplet_types.hpp"
+#include "cuda_scoring_range.hpp"
 
 #include <cstdint>
 #include <type_traits>
@@ -62,6 +63,18 @@ bool cuda_score_vinardo_device(
     const GpuRigidTransformArrayDevice& transforms,
     const std::uint32_t* selected_pose_ids,
     std::uint32_t selected_count,
+    GpuVinardoScoresDevice& output);
+
+// Batched counterpart: local selected IDs are offset by their device range's
+// pose_begin; begin/count select that ligand's typed atoms. Output order follows
+// selection order. Invalid ranges produce invalid score rows.
+bool cuda_score_vinardo_batch_device(
+    const GpuVinardoAtomsDevice& receptor,
+    const GpuVinardoAtomsDevice& ligand,
+    const GpuRigidTransformArrayDevice& transforms,
+    const std::uint32_t* selected_pose_ids,
+    std::uint32_t selected_count,
+    const GpuLigandScoringRange* selected_ranges,
     GpuVinardoScoresDevice& output);
 
 #endif

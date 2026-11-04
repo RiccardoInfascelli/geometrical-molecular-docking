@@ -25,11 +25,19 @@ Use a fresh output directory or CSV path for each run. Some applications overwri
 
 This single-complex pipeline scores every clash survivor with Fast, then applies WeightedInteraction
 to the Fast top-500 and exports up to 20 ranked poses. Its protein index uses the ligand's
-interaction-area diameter. It does not expose the CUDA application's ranking, cutoff or Top-K flags.
+interaction-area diameter. It does not expose the CUDA application's ranking or cutoff flags.
+Pose export supports `--pose-output none|topk|all`, `--top-k K` (default 20),
+`--pose-detail compact|full` and `--no-structures`. These options do not change the
+Fast prefilter or `benchmark.csv`. `all` means the available WeightedInteraction ranking,
+not poses excluded before rescoring. Optional `--timings` separates computation and export.
+`geometric_docking` defaults to quaternion alignment. Set
+`DOCKING_KABSCH_METHOD=svd` to select SVD instead; an existing environment
+selection is preserved.
 
 Set `DOCKING_AREA_CROP_MARGIN_A=8` to detect protein interaction areas on whole residues touching
 the pocket bounding box expanded by 8 Å. This can change Fast masks, targets and WeightedInteraction
-areas; its pocket filter still applies, while `--interaction-region protein` uses all cropped areas.
+areas; the pocket filter still applies. In `gpu_docking`, `--interaction-region protein`
+uses all detected cropped areas.
 Occupancy, target clearance and Vinardo-like keep the full protein. Unset the variable to disable
 cropping; zero is invalid. Shared host preparation and rescoring also apply this setting in CUDA
 applications. Use single-model PDB inputs for cropping. Crop mode and full/cropped atom counts
@@ -61,7 +69,9 @@ The main selection and rescoring options are:
 
 | Option | Meaning |
 | --- | --- |
-| `--top-k K` | Final poses exported per record; default 20. |
+| `--top-k K` | Rows per record in `topk` export mode; default 20. |
+| `--pose-output none\|topk\|all` | Skip pose files, export Top-K (default), or export the complete final ranked pool. |
+| `--pose-detail compact\|full` | Compact omits transformations and Vinardo components; full retains replay details. |
 | `--fast-prefilter none\|N` | Score all survivors, or only the Fast top-N, before rescoring; default `none`. |
 | `--rescoring-backend cpu\|cuda` | Backend for WeightedInteraction, Vinardo-like and Hybrid; default `cpu`. Search remains CUDA. |
 | `--interaction-region pocket\|protein` | Protein areas used by WeightedInteraction, including in Hybrid; default `pocket`. |
@@ -69,9 +79,21 @@ The main selection and rescoring options are:
 Vinardo-like always evaluates the full protein's supported heavy atoms, independently of
 `--interaction-region`. Top-K affects final export; a Fast prefilter changes the rescoring pool.
 
-Defaults are Fast ranking, no record limit, a 24 Å shared triplet cutoff and SVD alignment.
-Use `--cutoff A` to change the cutoff or `--kabsch quaternion` to select quaternion alignment.
+Defaults are Fast ranking, no record limit, a 24 Å shared triplet cutoff,
+quaternion alignment and optimized host queries. Use `--cutoff A` to change the
+cutoff, `--kabsch svd` for SVD or `--query-method reference` for reference queries.
+CLI selectors override `DOCKING_KABSCH_METHOD` and `DOCKING_QUERY_METHOD`;
+otherwise an existing environment selection takes precedence over these defaults.
 The example above overrides the ranking and rescoring defaults.
+
+Multi-ligand CUDA batching is available with `--gpu-batch on`, `--kabsch quaternion`
+and `--batch-size N`; non-Fast rankings require `--rescoring-backend cuda`.
+Geometry and scoring are aggregated, while prefilter and ranking remain per ligand.
+Add `--cpu-gpu-overlap on` for bounded multi-batch CPU prefetch, with `--timings`
+and CSV-only output. Oversized groups split automatically within the explicit
+budget. Batching and overlap remain disabled by default. When batching is enabled,
+its default maximum is 16 records with a 2048 MiB explicit memory budget.
+See the [batch guide](gpu-batch.md) for details.
 
 Host query preparation stays serial unless `DOCKING_QUERY_THREADS=N` requests more threads in
 an `ENABLE_OPENMP=ON` build. Small inputs still run serially; timing output records actual usage.
@@ -101,6 +123,10 @@ Use the same explicit record limit and cutoff when comparing them:
 and 30 on CUDA; both use a 24 Å cutoff. Protein preparation and a single shared index are reused
 across ligands, including those whose diameter exceeds the cutoff. No per-ligand fallback occurs.
 The cutoff limits indexed triplet sides and can reduce candidate coverage.
+The CUDA screener defaults to optimized host queries; set
+`DOCKING_QUERY_METHOD=reference` to retain reference query preparation.
+The screeners retain the low-level Kabsch default (SVD); set
+`DOCKING_KABSCH_METHOD=quaternion` explicitly when comparing with the docking applications.
 
 The CUDA screener optionally exports joint scores with `--rescore-output NEW_DIR`.
 Search and Fast remain on CUDA; WeightedInteraction and Vinardo-like are calculated on CPU.
@@ -132,8 +158,17 @@ symmetry correction. CPU diagnostics instead compare all retained atoms against 
 this measures crystal-reference error only when the input is that crystal pose. RMSD is never used
 for ranking.
 
+Both docking applications support the optional positional diagnostic
+`--pose-center-distance on --center-reference-mol2 /path/to/one-reference.mol2`.
+It adds `center_distance_A` to exported pose rows without changing ranking.
+The metric compares heavy-atom centroids in the protein frame and requires no
+atom correspondence to the shared reference. It is distinct from RMSD and OFF
+by default; see [output controls](output.md) for reference and export rules.
+
 Check statuses and errors before interpreting results. Screening `ok` can still mean zero
 survivors; a missing score or RMSD is not zero. Preserve stdout, stderr and exit status.
 CPU and CUDA timing fields do not always cover identical work and are not always directly comparable.
 For score definitions and scientific limitations, see the
 [algorithm guide](come-funziona-il-docking.md).
+See [output controls](output.md) for benchmark-minimal exports, RMSD evaluation scope,
+timing boundaries and the complete-pool requirements of offline analysis.

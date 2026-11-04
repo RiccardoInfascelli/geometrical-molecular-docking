@@ -8,6 +8,8 @@
 #include <array>
 #include <vector>
 
+namespace RDKit { class ROMol; }
+
 // Maximum distance between chemical-area centroids, not between ligand atoms.
 // Returns zero when fewer than two areas are available.
 double compute_ligand_diameter(
@@ -27,6 +29,15 @@ struct RigidTransform
         0.0, 0.0, 0.0
     };
 };
+
+// Geometric centroid in angstroms, using atoms with atomic number > 1.
+// Requires finite heavy-atom coordinates and at least one heavy atom.
+std::array<double, 3> heavy_atom_centroid(const RDKit::ROMol& molecule);
+
+// Distance in the receptor frame after R*c+t. Linearity makes this the
+// centroid of the transformed atoms; no fitting, mapping or symmetry search.
+double pose_center_distance(const std::array<double, 3>& ligand_center,
+    const RigidTransform& transform, const std::array<double, 3>& reference_center);
 
 
 // Applies R * point + t in double, then casts back to coordinate_type.

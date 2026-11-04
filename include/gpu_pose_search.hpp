@@ -5,6 +5,7 @@
 #include "ligand_preparation.hpp"
 #include "protein_preparation.hpp"
 #include "pose_generation.hpp"
+#include "gpu_ligand_preparation.hpp"
 
 #include <cstddef>
 #include <optional>
@@ -19,6 +20,8 @@ struct PreparedGpuTarget {
     GpuFlatTripletIndexDevice device_index{};
     GpuPointArrayDevice device_target_points{};
     GpuProteinGridDevice device_grid{};
+    // Scratch belongs to this target and is reused only by completed, serialized searches.
+    mutable GpuClashCompactionWorkspace compaction_workspace;
     std::size_t index_records = 0;
     std::size_t index_keys = 0;
     double target_prep_seconds = 0.0;
@@ -71,11 +74,14 @@ public:
 // the pool is downloaded; device_result instead retains it with no bulk download
 // and leaves pipeline.poses empty. Its owner may outlive this search call.
 // Empty triplets or an empty index return an empty result without device lookup.
-// The blocking call completes device work and releases search inputs/intermediates.
+// The blocking call completes device work and releases per-ligand inputs; the
+// target retains compaction scratch for subsequent serialized searches.
 // Non-null stages enables the same diagnostic stage synchronizations as the
 // screening driver. Download intervals are collected only when requested;
 // pipeline stage timings are appended to stages, preserving its existing items.
 // collect_query_timings measures host packing without adding device synchronization.
+// A prepared packet borrows its already packed queries instead; it must own this
+// exact molecule/feature snapshot and remain unchanged until the call returns.
 GpuLigandSearchResult run_gpu_ligand_search(
     const RDKit::ROMol& molecule,
     const PreparedLigand& ligand,
@@ -84,7 +90,8 @@ GpuLigandSearchResult run_gpu_ligand_search(
     StageProfile* stages = nullptr,
     GpuPosePipelineTimings* download_timings = nullptr,
     GpuPosePipelineDeviceResult* device_result = nullptr,
-    bool collect_query_timings = false
+    bool collect_query_timings = false,
+    const GpuPreparedLigand* prepared = nullptr
 );
 
 #endif

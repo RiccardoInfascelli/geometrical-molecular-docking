@@ -179,13 +179,26 @@ __global__ void weighted_interaction_score_kernel(
     GpuWeightedInteractionAreasDevice protein, GpuWeightedInteractionAreasDevice ligand,
     const GpuRigidTransform* transforms, std::uint32_t transform_count,
     const std::uint32_t* selected, std::uint32_t count,
+    const GpuLigandScoringRange* selected_ranges,
     GpuWeightedInteractionWeights weights, unsigned char* satisfied_protein,
     GpuWeightedInteractionScore* output) {
     const auto linear = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (linear >= count) return;
     const auto index = static_cast<std::uint32_t>(linear);
     GpuWeightedInteractionScore score{};
-    const std::uint32_t pose_id = selected ? selected[index] : index;
+    std::uint32_t pose_id = selected ? selected[index] : index;
+    std::uint32_t ligand_begin = 0, ligand_count = ligand.count;
+    if (selected_ranges) {
+        const auto range = selected_ranges[index];
+        if (range.begin > ligand.count || range.count > ligand.count - range.begin ||
+            range.pose_begin > transform_count || pose_id >= transform_count - range.pose_begin) {
+            output[index] = score;
+            return;
+        }
+        ligand_begin = range.begin;
+        ligand_count = range.count;
+        pose_id += range.pose_begin;
+    }
     if (pose_id >= transform_count || !transforms[pose_id].valid) {
         output[index] = score;
         return;
@@ -194,8 +207,8 @@ __global__ void weighted_interaction_score_kernel(
     auto* coverage = protein.count ? satisfied_protein +
         static_cast<std::size_t>(index) * protein.count : nullptr;
     for (std::uint32_t p = 0; p < protein.count; ++p) coverage[p] = 0;
-    for (std::uint32_t l = 0; l < ligand.count; ++l) {
-        const auto ligand_area = transform_area(ligand.areas[l], transform);
+    for (std::uint32_t l = 0; l < ligand_count; ++l) {
+        const auto ligand_area = transform_area(ligand.areas[ligand_begin + l], transform);
         bool satisfied = false;
         // The reward belongs to this physical area, not to each contact.
         // Starting at zero also preserves CPU behavior for negative weights.
@@ -263,10 +276,12 @@ bool cuda_upload_weighted_interaction_areas(const std::vector<GpuWeightedInterac
     return true;
 }
 
-bool cuda_score_weighted_interaction_device(
+namespace {
+bool score_weighted_interaction_device(
     const GpuWeightedInteractionAreasDevice& protein, const GpuWeightedInteractionAreasDevice& ligand,
     const GpuRigidTransformArrayDevice& transforms,
     const std::uint32_t* selected_pose_ids, std::uint32_t selected_count,
+    const GpuLigandScoringRange* selected_ranges,
     const GpuWeightedInteractionWeights& weights, GpuWeightedInteractionScoresDevice& output) {
     cuda_free_weighted_interaction_scores(output);
     if ((protein.count && !protein.areas) || (ligand.count && !ligand.areas) ||
@@ -290,7 +305,8 @@ bool cuda_score_weighted_interaction_device(
     const auto blocks = static_cast<unsigned int>((static_cast<std::uint64_t>(selected_count) +
                                                   threads - 1) / threads);
     weighted_interaction_score_kernel<<<blocks, threads>>>(protein, ligand, transforms.transforms,
-        transforms.count, selected_pose_ids, selected_count, weights, coverage, replacement.scores);
+        transforms.count, selected_pose_ids, selected_count, selected_ranges,
+        weights, coverage, replacement.scores);
     const bool launched = cudaGetLastError() == cudaSuccess;
     const bool completed = launched && cudaDeviceSynchronize() == cudaSuccess;
     if (coverage) cudaFree(coverage);
@@ -301,4 +317,28 @@ bool cuda_score_weighted_interaction_device(
     replacement.count = selected_count;
     output = replacement;
     return true;
+}
+} // namespace
+
+bool cuda_score_weighted_interaction_device(
+    const GpuWeightedInteractionAreasDevice& protein, const GpuWeightedInteractionAreasDevice& ligand,
+    const GpuRigidTransformArrayDevice& transforms,
+    const std::uint32_t* selected_pose_ids, std::uint32_t selected_count,
+    const GpuWeightedInteractionWeights& weights, GpuWeightedInteractionScoresDevice& output) {
+    return score_weighted_interaction_device(protein, ligand, transforms,
+        selected_pose_ids, selected_count, nullptr, weights, output);
+}
+
+bool cuda_score_weighted_interaction_batch_device(
+    const GpuWeightedInteractionAreasDevice& protein, const GpuWeightedInteractionAreasDevice& ligand,
+    const GpuRigidTransformArrayDevice& transforms,
+    const std::uint32_t* selected_pose_ids, std::uint32_t selected_count,
+    const GpuLigandScoringRange* selected_ranges,
+    const GpuWeightedInteractionWeights& weights, GpuWeightedInteractionScoresDevice& output) {
+    if (selected_count && (!selected_pose_ids || !selected_ranges)) {
+        cuda_free_weighted_interaction_scores(output);
+        return false;
+    }
+    return score_weighted_interaction_device(protein, ligand, transforms,
+        selected_pose_ids, selected_count, selected_ranges, weights, output);
 }

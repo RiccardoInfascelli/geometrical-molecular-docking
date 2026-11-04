@@ -34,7 +34,8 @@ bool cuda_run_pose_pipeline(
     double clash_threshold,
     GpuPosePipelineResult& result,
     GpuPosePipelineTimings* timings,
-    GpuPosePipelineDeviceResult* device_result
+    GpuPosePipelineDeviceResult* device_result,
+    GpuClashCompactionWorkspace* compaction_workspace
 )
 {
     if (device_result) device_result->clear();
@@ -214,7 +215,8 @@ bool cuda_run_pose_pipeline(
             device_clash_scores,
             clash_threshold,
             device_survivors,
-            valid_transform_count
+            valid_transform_count,
+            compaction_workspace
         ); })
     ) {
         cuda_free_clash_scores(
@@ -525,7 +527,8 @@ bool cuda_run_pose_pipeline(
     const std::vector<GpuAlignmentCandidate>& alignments,
     double clash_threshold,
     GpuPosePipelineResult& result,
-    GpuPosePipelineTimings* timings
+    GpuPosePipelineTimings* timings,
+    GpuClashCompactionWorkspace* compaction_workspace
 )
 {
     if (timings) {
@@ -619,7 +622,9 @@ bool cuda_run_pose_pipeline(
             device_alignments,
             clash_threshold,
             result,
-            timings
+            timings,
+            nullptr,
+            compaction_workspace
         );
 
 

@@ -120,9 +120,26 @@ GpuLigandSearchResult run_gpu_ligand_search(
     const RDKit::ROMol& molecule, const PreparedLigand& ligand,
     const PreparedGpuTarget& target, const RunConfig& config,
     StageProfile* stages, GpuPosePipelineTimings* download_timings,
-    GpuPosePipelineDeviceResult* device_result, bool collect_query_timings) {
+    GpuPosePipelineDeviceResult* device_result, bool collect_query_timings,
+    const GpuPreparedLigand* prepared) {
     GpuLigandSearchResult result;
-    result.query_threads_requested = gpu_query_requested_threads();
+    try {
+        result.query_threads_requested = gpu_query_requested_threads();
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception& error) {
+        if (prepared) throw GpuQueryPreparationError(error.what());
+        throw;
+    }
+    if (prepared) {
+        if (prepared->molecule.get() != &molecule || &prepared->ligand != &ligand ||
+            prepared->bin_size != config.triplet_bin_size)
+            throw GpuQueryPreparationError("Prepared GPU packet does not match this molecule, ligand or bin size");
+        if (prepared->query_info.requested_threads != result.query_threads_requested)
+            throw GpuQueryPreparationError("Query thread selector changed after host preparation");
+        result.query_threads_used = prepared->query_info.used_threads;
+        result.query_preparation_seconds = prepared->query_preparation_seconds;
+    }
     if (device_result) device_result->clear();
     std::size_t completed_valid_transforms = 0;
     std::size_t completed_survivors = 0;
@@ -147,18 +164,28 @@ GpuLigandSearchResult run_gpu_ligand_search(
     };
     try {
         LigandDeviceBuffers device;
-        std::vector<GpuTripletKey> queries;
-        std::vector<GpuLigandTripletOrders> orders;
-        const bool time_queries = stages || collect_query_timings;
-        const auto query_start = time_queries ? Clock::now() : Clock::time_point{};
-        GpuQueryPreparationInfo query_info;
-        make_gpu_ligand_triplet_queries(ligand.triplets, config.triplet_bin_size, queries, orders, &query_info);
-        result.query_threads_used = query_info.used_threads;
-        if (time_queries) result.query_preparation_seconds = seconds_since(query_start);
+        std::vector<GpuTripletKey> local_queries;
+        std::vector<GpuLigandTripletOrders> local_orders;
+        if (prepared) {
+            if (!prepared->queries_enabled)
+                throw std::invalid_argument("Prepared GPU packet has no queries for a nonempty index");
+        } else {
+            const bool time_queries = stages || collect_query_timings;
+            const auto query_start = time_queries ? Clock::now() : Clock::time_point{};
+            GpuQueryPreparationInfo query_info;
+            make_gpu_ligand_triplet_queries(ligand.triplets, config.triplet_bin_size,
+                                           local_queries, local_orders, &query_info);
+            result.query_threads_used = query_info.used_threads;
+            if (time_queries) result.query_preparation_seconds = seconds_since(query_start);
+        }
+        // The caller owns prepared arrays until this blocking call completes.
+        // The legacy path still builds its local arrays in the original place.
+        const auto& queries = prepared ? prepared->queries : local_queries;
+        const auto& orders = prepared ? prepared->orders : local_orders;
         if (stages)
             stages->push_back({"query_preparation", result.query_preparation_seconds * 1000.0,
                                queries.size(), "observed_host_queries"});
-        if (queries.size() != orders.size())
+        if (queries.size() != orders.size() || (prepared && queries.size() != ligand.triplets.size()))
             throw std::runtime_error("GPU query/order mismatch");
 
         // Count/scan/expand reserves disjoint ranges, preserving query, neighbor,
@@ -201,7 +228,8 @@ GpuLigandSearchResult run_gpu_ligand_search(
 
         require_cuda(cuda_run_pose_pipeline(device.matching_points, target.device_target_points,
                      device.atoms, device.fast_areas, target.device_grid, device.alignments,
-                     config.operational_clash_threshold, result.pipeline, pipeline_timings, device_result),
+                     config.operational_clash_threshold, result.pipeline, pipeline_timings, device_result,
+                     &target.compaction_workspace),
                      "device-resident pose pipeline");
         if (stages)
             stages->insert(stages->end(), pipeline_timings->stages.begin(), pipeline_timings->stages.end());

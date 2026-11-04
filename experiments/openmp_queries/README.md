@@ -27,12 +27,13 @@ Initial ligand coordinates need not already place the ligand in the pocket:
 python3 experiments/openmp_queries/run_benchmark.py \
   --protein /absolute/path/protein.pdb \
   --pocket /absolute/path/pocket.pdb \
+  --ligands /absolute/path/library.mol2 \
   --executable /absolute/path/build/cuda-openmp/gpu_docking \
   --output /absolute/path/new-openmp-campaign
 ```
 
-The output directory must be new. The default library is
-`/work/rinfascelli/Commercial_higher500.mol2`, and `--limit 1000` selects its first
+The output directory must be new. Supply `--ligands` explicitly rather than
+relying on the runner's site-specific default. `--limit 1000` selects the first
 1000 original records. There are three repeats for threads 1, 2, 4 and 8, for:
 
 | Ranking | Rescoring backend | Fixed scoring parameters |

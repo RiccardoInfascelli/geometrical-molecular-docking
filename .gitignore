@@ -16,8 +16,20 @@ venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.cache/
+
+# Run logs and editor scratch files.
+*.log
+/logs/
+/runs/
+/slurm-*.out
+/slurm-*.err
+*.swp
+*.swo
+*~
 
 # Generated scientific output stays on disk. Existing tracked results stay tracked.
+/datasets/
 /results/
 /results-whole-protein/
 /results_flat_test/

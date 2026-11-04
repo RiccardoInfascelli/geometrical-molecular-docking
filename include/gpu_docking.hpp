@@ -7,15 +7,20 @@
 #include "pose_score_ranking.hpp"
 
 #include <cstddef>
+#include <chrono>
+#include <exception>
 #include <memory>
 #include <optional>
 
 namespace RDKit { class RWMol; }
+struct GpuPreparedLigand;
 
 enum class GpuRescoringBackend { Cpu, Cuda };
 
-// Completed host-wall intervals, including wrapper allocation and device waits;
-// these are not isolated kernel times. Disabled collection leaves them zero.
+// Host work durations, including allocation and device waits, not kernel times.
+// Prepared search_seconds adds producer query work to the completed consumer
+// search span; it is not pipeline elapsed time. Nested timings are not additive.
+// Disabled collection leaves durations zero and absolute boundaries unset.
 struct GpuDockingTimings {
     double preparation_seconds = 0.0;
     double search_seconds = 0.0;
@@ -34,6 +39,11 @@ struct GpuDockingTimings {
     double hybrid_seconds = 0.0;
     double score_preparation_seconds = 0.0;
     double rescoring_download_seconds = 0.0;
+    // Absolute host boundaries for explicit prepared CUDA rescoring. These
+    // completed wrapper spans include host work/copies/waits, not just kernels.
+    // Legacy and Fast calls leave them unset to preserve their timing scopes.
+    std::chrono::steady_clock::time_point geometry_start{}, geometry_end{};
+    std::chrono::steady_clock::time_point rescoring_start{}, rescoring_end{};
 };
 
 struct GpuDockingSettings {
@@ -63,6 +73,16 @@ struct GpuDockingResult {
     StageProfile stages;
 };
 
+// One completed aggregate search, including packing, copies and cleanup.
+// Per-record GPU elapsed times are unavailable when kernels mix their work.
+struct GpuDockingBatchTimings {
+    double search_seconds = 0.0;
+    double rescoring_seconds = 0.0;
+    GpuDockingTimings rescoring;
+    // Conservative planned allocation bound, not measured peak VRAM.
+    std::size_t explicit_device_bytes = 0;
+};
+
 // One fixed protein/pocket and shared-cutoff index uploaded once. Calls process
 // ligands in order; poses of each ligand run in parallel on CUDA. Not thread safe.
 // Parsing, sanitization, RMSD and export belong to the caller. CPU rescoring
@@ -81,6 +101,22 @@ public:
     // Default settings preserve descending Fast. Other methods use the selected
     // rescoring backend, never RMSD. Ties follow the original survivor ID.
     GpuDockingResult dock(RDKit::RWMol& ligand, std::size_t k);
+    // Does not repeat ligand/query preparation on the CUDA owner thread. The packet
+    // remains owned by the caller and must stay unchanged throughout this call.
+    // As with dock(), concurrent calls on one screen are not supported.
+    GpuDockingResult dock_prepared(GpuPreparedLigand& ligand, std::size_t k);
+    // Aggregated geometry and CUDA scoring, returning one result per packet.
+    // Prefilter and ranking/Hybrid normalization remain per-ligand calls.
+    // Explicit bytes exclude the shared receptor and wrapper-internal scratch.
+    // Optional errors isolate record-level selection failures; device/resource
+    // failures remain fatal. Calls on this screen must remain serialized.
+    std::vector<GpuDockingResult> dock_batch_prepared(
+        const std::vector<GpuPreparedLigand*>& ligands, std::size_t k,
+        std::size_t max_device_bytes, GpuDockingBatchTimings* timings = nullptr,
+        std::vector<std::exception_ptr>* record_errors = nullptr);
+    // Release retained batch scratch after a completed/failed blocking call.
+    // Intended for explicit-budget retries; never call concurrently with docking.
+    void release_batch_scratch() noexcept;
     std::size_t index_records() const;
     double startup_seconds() const; // zero when timing collection is disabled
     std::size_t targets_before_pruning() const;
@@ -88,6 +124,8 @@ public:
     std::size_t vinardo_skipped_receptor_atoms() const;
 
 private:
+    GpuDockingResult dock_impl(RDKit::RWMol& ligand, std::size_t k,
+                              const GpuPreparedLigand* prepared);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

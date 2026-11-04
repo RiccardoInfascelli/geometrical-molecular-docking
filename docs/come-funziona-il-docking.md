@@ -4,7 +4,8 @@
 
 The program performs rigid protein–ligand docking in a known binding pocket. It searches for the
 ligand's position and orientation without changing its internal conformation or the protein.
-It does not explore ligand torsions or locate an unknown pocket.
+Each search keeps the ligand conformation fixed and does not locate an unknown pocket.
+The separate ensemble application generates conformers before running rigid searches.
 
 Compatible triangles of chemical features provide candidate correspondences. Kabsch alignment
 turns each correspondence into a pose of the whole ligand, followed by clash filtering and scoring.
@@ -42,6 +43,8 @@ These keys propose contacts; WeightedInteraction evaluates physical interaction 
 
 RDKit loads the protein and pocket PDB files and ligand MOL2 records. Protein and ligand molecules
 are sanitized before extracting physical and matching areas.
+An optional whole-residue pocket crop limits chemical-area extraction. It can change search
+features, Fast masks and WeightedInteraction areas; clash and Vinardo retain the full protein.
 
 Protein preparation builds a voxel grid around the pocket. Occupied voxels approximate the protein's
 van der Waals volume; free voxels carry chemical-compatibility masks. Free space and chemical
@@ -80,8 +83,9 @@ deduplication. See [triplet_generation.cpp](../src/triplet_generation.cpp).
 ## Rigid alignment and clash filtering
 
 Kabsch minimizes the squared distances between three ordered point pairs using a proper rotation
-and translation, excluding reflections. SVD is the default; quaternion/Jacobi is also available on
-CPU and CUDA. Both fit in double precision. The transform places the whole ligand, but no maximum
+and translation, excluding reflections. SVD and quaternion/Jacobi are available on CPU and CUDA.
+The two docking applications default to quaternion; the low-level alignment API retains SVD
+unless selected otherwise. Both fit in double precision. The transform places the whole ligand, but no maximum
 fit-residual threshold is applied: approximate triangle matches can leave imperfect point overlap.
 
 The clash filter measures the fraction of transformed ligand atom centres in occupied protein
@@ -138,8 +142,8 @@ Hybrid combines WeightedInteraction and sign-reversed adjusted Vinardo:
 H=\lambda z(W)+(1-\lambda)z(-V_\alpha).
 \]
 
-Higher is better. Each z-score uses the mean and population standard deviation of the full
-rescoring pool for that ligand, after any Fast prefilter and before Top-K selection.
+Higher is better. In ordinary docking, each z-score uses the mean and population standard deviation
+of the full rescoring pool for that ligand, after any Fast prefilter and before Top-K selection.
 Constant components contribute zero. Scores normalized on different pools are not directly
 comparable. Lambda defaults to 0.3 and is configurable in [0, 1]; alpha is independent, so Hybrid
 does not imply rep50. See [pose_score_ranking.cpp](../src/pose_score_ranking.cpp).
@@ -149,6 +153,12 @@ does not imply rep50. See [pose_score_ranking.cpp](../src/pose_score_ranking.cpp
 Both prepare molecular chemistry on the host. CUDA performs lookup, alignment, clash filtering and
 Fast scoring on the device, reusing the protein grid, targets and index across ligands.
 `gpu_docking` supports CPU or CUDA rescoring and ranking.
+It processes one ligand at a time by default. Optional aggregate batches share receptor data and
+run lookup, geometry and scoring over multiple ligands, preserving independent ranking pools.
+CPU prefetch can prepare later ligands while a single CUDA consumer processes ready inputs.
+Reference and optimized host queries preserve the same ordered query contents.
+The CUDA application entry points default to optimized queries; the low-level
+query API retains reference preparation unless explicitly selected otherwise.
 
 | Application | Search and scoring protocol |
 | --- | --- |
@@ -164,20 +174,33 @@ ligand diameter, so these policies can generate different pools. Prefilters and 
 differ between applications; equal scoring formulas do not make their protocols interchangeable.
 See the [usage guide](uso.md) for application options.
 
+The [conformer application](../experiments/ligand_conformer_docking/README.md) evaluates generated
+conformers against one shared receptor. Its full-pool protocol computes raw scores for every
+survivor, then normalizes Hybrid once across the generated ensemble, independently of batch size.
+The crystallographic baseline is evaluated and normalized separately. Its explicit RMSD Oracle
+orders all generated-conformer survivors by reference RMSD; it is a diagnostic bound on the
+available pool, not a predictive score. Local ranks use the same global Hybrid scores.
+
 ## RMSD and limitations
 
 RMSD measures coordinate differences under fixed atom correspondence, in angstroms.
 No superposition onto the reference or symmetry correction is performed. To measure docking error,
-the reference must represent the same ligand in the protein frame. RMSD never selects or ranks poses.
+the reference must represent the same ligand in the protein frame. Energy rankings do not use RMSD;
+the explicit ensemble Oracle above is a separate reference-based diagnostic.
 
 CPU pose-generation diagnostics compare all retained atoms with the input conformer, by atom index.
 This measures crystal-reference error only when that input is the crystal pose in the protein frame.
 An arbitrarily placed input is valid for search, but its automatic CPU RMSD is not that error.
 
-With a separate optional reference, `gpu_docking` evaluates heavy-atom RMSD for exported poses
-after ranking. It requires matching atom order and molecular graph, including explicit hydrogens,
+With a separate optional reference, `gpu_docking` evaluates heavy-atom RMSD after ranking.
+Output controls can request metrics over the complete ranked post-prefilter pool, independently
+of pose export. It requires matching atom order and molecular graph, including explicit hydrogens,
 but excludes hydrogens from RMSD. It does not infer correspondence. These values need not match CPU
 diagnostics. See [gpu_docking_output.cpp](../src/gpu_docking_output.cpp).
+
+Optional `center_distance_A` measures separation of the transformed heavy-atom geometric centroids
+in the receptor frame. It needs no atom correspondence, so a shared reference for unrelated ligands
+describes spatial position only. It is distinct from RMSD and never affects selection.
 
 The lowest available RMSD measures coverage of the candidate pool; Top-K RMSD also reflects ranking.
 The search is not exhaustive: rigid conformations, feature typing, target sampling, cutoff and

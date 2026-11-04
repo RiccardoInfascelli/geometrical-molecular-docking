@@ -17,6 +17,7 @@ if(ENABLE_CUDA)
     find_package(CUDAToolkit REQUIRED)
 endif()
 find_package(Eigen3 REQUIRED)
+find_package(Threads REQUIRED)
 add_subdirectory(../chem-interactions ${CMAKE_BINARY_DIR}/chem-interactions)
 
 # Shared host code. These CUDA data adapters do not require a CUDA compiler.
@@ -32,6 +33,8 @@ add_library(docking_core
     src/protein_preparation.cpp
     src/protein_area_crop.cpp
     src/ligand_preparation.cpp
+    src/gpu_ligand_preparation.cpp
+    src/gpu_ligand_prefetch.cpp
     src/pose_generation.cpp
     src/stage_profile.cpp
     src/pose_targets.cpp
@@ -49,7 +52,12 @@ add_library(docking_core
     src/cuda/cuda_grid.cpp
     src/cuda/cuda_fast_scoring.cpp)
 target_include_directories(docking_core PUBLIC include)
-target_link_libraries(docking_core PUBLIC libinteraction Eigen3::Eigen)
+target_link_libraries(docking_core PUBLIC libinteraction Eigen3::Eigen Threads::Threads)
+# NVTX is optional and used only by explicit overlap traces, never to synchronize.
+if(ENABLE_CUDA AND TARGET CUDA::nvToolsExt)
+    target_link_libraries(docking_core PRIVATE CUDA::nvToolsExt)
+    target_compile_definitions(docking_core PRIVATE DOCKING_HAVE_NVTX)
+endif()
 if(ENABLE_OPENMP)
     find_package(OpenMP REQUIRED COMPONENTS CXX)
     target_link_libraries(docking_core PUBLIC OpenMP::OpenMP_CXX)
@@ -80,6 +88,7 @@ if(ENABLE_CUDA)
         src/cuda/cuda_grid_upload.cu
         src/cuda/cuda_clash.cu
         src/cuda/cuda_compaction.cu
+        src/cuda/cuda_ligand_batch.cu
         src/cuda/cuda_fast_score.cu
         src/cuda/cuda_pose_pipeline.cpp
         src/cuda/cuda_screening_batch.cu)
@@ -88,14 +97,15 @@ if(ENABLE_CUDA)
         libinteraction Eigen3::Eigen CUDA::cudart CUDA::cusolver)
     set_target_properties(docking_cuda PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
 
-    add_library(docking_gpu_search src/cuda/gpu_pose_search.cpp)
+    add_library(docking_gpu_search src/cuda/gpu_pose_search.cpp src/cuda/gpu_ligand_batch.cpp)
     target_include_directories(docking_gpu_search PUBLIC include)
     target_link_libraries(docking_gpu_search PUBLIC docking_core docking_cuda)
 
     add_library(docking_cuda_rescoring
         src/cuda/cuda_weighted_interaction_scoring.cpp src/cuda/cuda_weighted_interaction_scoring.cu
         src/cuda/cuda_vinardo_scoring.cpp src/cuda/cuda_vinardo_scoring.cu
-        src/cuda/cuda_pose_ranking.cu src/cuda/cuda_pose_rescoring.cpp)
+        src/cuda/cuda_pose_ranking.cu src/cuda/cuda_pose_rescoring.cpp
+        src/cuda/cuda_ligand_batch_rescoring.cpp)
     target_include_directories(docking_cuda_rescoring PUBLIC include)
     target_link_libraries(docking_cuda_rescoring PUBLIC docking_cuda docking_rescoring)
     set_target_properties(docking_cuda_rescoring PROPERTIES
@@ -159,7 +169,10 @@ if(BUILD_EXPERIMENTS)
     target_link_libraries(serial_docking PRIVATE docking_core)
     bsl_set_cxx_flags(serial_docking)
     add_executable(vinardo_rescore_experiment experiments/scoring/vinardo_rescore_experiment.cpp)
-    target_link_libraries(vinardo_rescore_experiment PRIVATE docking_rescoring)
+    add_library(joint_diagnostics experiments/scoring/joint_diagnostics.cpp)
+    target_include_directories(joint_diagnostics PUBLIC experiments/scoring)
+    target_link_libraries(joint_diagnostics PUBLIC docking_gpu_output)
+    target_link_libraries(vinardo_rescore_experiment PRIVATE joint_diagnostics)
     if(ENABLE_CUDA)
         add_executable(multi_ligand_screen_gpu_batch
             experiments/screening_batch/multi_ligand_screen_gpu_batch.cpp)
@@ -171,7 +184,8 @@ endif()
 if(BUILD_TESTING)
     set(CPU_CORE_TESTS
         gpu_fast_scoring_test gpu_grid_test gpu_triplet_index_test gpu_geometry_test
-        rigid_alignment_test pose_generation_test pose_ranking_test molecule_io_test)
+        rigid_alignment_test pose_generation_test pose_ranking_test molecule_io_test pose_output_test
+        gpu_ligand_prefetch_test gpu_batch_retry_test overlap_timing_test)
     foreach(test IN LISTS CPU_CORE_TESTS)
         add_executable(${test} tests/cpu/${test}.cpp)
         target_link_libraries(${test} PRIVATE docking_core)
@@ -186,6 +200,11 @@ if(BUILD_TESTING)
     target_link_libraries(gpu_docking_output_test PRIVATE docking_gpu_output)
     set(CPU_TESTS ${CPU_CORE_TESTS} pose_score_ranking_test pose_rescoring_test
         gpu_docking_config_test gpu_docking_output_test)
+    if(TARGET joint_diagnostics)
+        add_executable(joint_diagnostics_test tests/cpu/joint_diagnostics_test.cpp)
+        target_link_libraries(joint_diagnostics_test PRIVATE joint_diagnostics)
+        list(APPEND CPU_TESTS joint_diagnostics_test)
+    endif()
 
     if(ENABLE_CUDA)
         set(CUDA_CORE_TESTS
@@ -199,11 +218,16 @@ if(BUILD_TESTING)
         target_link_libraries(cuda_pose_rescoring_test PRIVATE docking_cuda_rescoring docking_gpu_output)
         add_executable(cuda_screening_batch_test tests/cuda/cuda_screening_batch_test.cpp)
         target_link_libraries(cuda_screening_batch_test PRIVATE docking_core docking_cuda)
+        add_executable(cuda_ligand_batch_test tests/cuda/cuda_ligand_batch_test.cpp)
+        target_link_libraries(cuda_ligand_batch_test PRIVATE docking_cuda)
+        add_executable(cuda_ligand_batch_rescoring_test tests/cuda/cuda_ligand_batch_rescoring_test.cpp)
+        target_link_libraries(cuda_ligand_batch_rescoring_test PRIVATE docking_cuda_rescoring docking_gpu_search)
         add_executable(cuda_real_pipeline_test tests/integration/cuda_real_pipeline_test.cpp)
         target_link_libraries(cuda_real_pipeline_test PRIVATE docking_core docking_cuda)
         add_executable(cpu_cuda_docking_test tests/integration/cpu_cuda_docking_test.cpp)
         target_link_libraries(cpu_cuda_docking_test PRIVATE docking_gpu_screen)
-        set(CUDA_TESTS ${CUDA_CORE_TESTS} cuda_pose_rescoring_test cuda_screening_batch_test)
+        set(CUDA_TESTS ${CUDA_CORE_TESTS} cuda_pose_rescoring_test cuda_screening_batch_test
+            cuda_ligand_batch_test cuda_ligand_batch_rescoring_test)
     endif()
 
     # Isolated experimental builds register their own tests, not unbuilt engine targets.
@@ -220,6 +244,12 @@ if(BUILD_TESTING)
             "DOCKING_KABSCH_METHOD=svd;DOCKING_CPU_CLASH_METHOD=original;DOCKING_CPU_SCREENING_ONLY=0;DOCKING_QUERY_METHOD=reference;DOCKING_PROFILE_STAGES=0")
         find_package(Python3 COMPONENTS Interpreter QUIET)
         if(Python3_Interpreter_FOUND)
+            if(TARGET joint_diagnostics)
+                add_test(NAME joint_diagnostics_cli_test COMMAND ${Python3_EXECUTABLE} -B
+                    ${CMAKE_CURRENT_SOURCE_DIR}/experiments/scoring/joint_diagnostics_cli_test.py
+                    $<TARGET_FILE:vinardo_rescore_experiment>)
+                set_tests_properties(joint_diagnostics_cli_test PROPERTIES LABELS "cpu;synthetic;python")
+            endif()
             foreach(script IN ITEMS test_clearance_pruning test_gpu_rescoring_comparison)
                 add_test(NAME ${script} COMMAND ${Python3_EXECUTABLE} -B
                     ${CMAKE_CURRENT_SOURCE_DIR}/scripts/${script}.py)
@@ -251,6 +281,29 @@ if(BUILD_TESTING)
                         ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/gpu_docking_library_test.py
                         $<TARGET_FILE:gpu_docking> "${DOCKING_TEST_COMPLEX}")
                     set_tests_properties(gpu_docking_library_test PROPERTIES LABELS "cuda;integration;python")
+                    add_test(NAME gpu_docking_overlap_test COMMAND ${Python3_EXECUTABLE} -B
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/gpu_docking_overlap_test.py
+                        $<TARGET_FILE:gpu_docking> "${DOCKING_TEST_COMPLEX}")
+                    set_tests_properties(gpu_docking_overlap_test PROPERTIES
+                        LABELS "cuda;integration;python" TIMEOUT 600)
+                    add_test(NAME gpu_docking_batch_test COMMAND ${Python3_EXECUTABLE} -B
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/gpu_docking_batch_test.py
+                        $<TARGET_FILE:gpu_docking> "${DOCKING_TEST_COMPLEX}")
+                    set_tests_properties(gpu_docking_batch_test PROPERTIES
+                        LABELS "cuda;integration;python" TIMEOUT 900)
+                    foreach(method IN ITEMS weighted-interaction vinardo vinardo-rep50 hybrid)
+                        string(REPLACE "-" "_" test_method "${method}")
+                        add_test(NAME gpu_docking_batch_${test_method}_test COMMAND ${Python3_EXECUTABLE} -B
+                            ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/gpu_docking_batch_test.py
+                            $<TARGET_FILE:gpu_docking> "${DOCKING_TEST_COMPLEX}" --ranking "${method}")
+                        set_tests_properties(gpu_docking_batch_${test_method}_test PROPERTIES
+                            LABELS "cuda;integration;python" TIMEOUT 1800)
+                    endforeach()
+                    add_test(NAME gpu_docking_batch_overlap_test COMMAND ${Python3_EXECUTABLE} -B
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/gpu_docking_batch_overlap_test.py
+                        $<TARGET_FILE:gpu_docking> "${DOCKING_TEST_COMPLEX}")
+                    set_tests_properties(gpu_docking_batch_overlap_test PROPERTIES
+                        LABELS "cuda;integration;python" TIMEOUT 1800)
                 endif()
             endif()
         endif()

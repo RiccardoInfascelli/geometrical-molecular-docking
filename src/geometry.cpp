@@ -2,7 +2,64 @@
 
 #include <interaction/geometric_features.hpp>
 
+#include <GraphMol/Atom.h>
+#include <GraphMol/Conformer.h>
+#include <GraphMol/ROMol.h>
+
 #include <cmath>
+#include <stdexcept>
+
+std::array<double, 3> heavy_atom_centroid(const RDKit::ROMol& molecule)
+{
+    if (!molecule.getNumConformers())
+        throw std::invalid_argument("Pose center distance requires molecular coordinates");
+    const auto& conformer = molecule.getConformer();
+    std::array<long double, 3> sum{};
+    std::size_t count = 0;
+    for (const auto* atom : molecule.atoms()) {
+        if (atom->getAtomicNum() <= 1) continue;
+        const auto& point = conformer.getAtomPos(atom->getIdx());
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
+            throw std::invalid_argument("Pose center distance requires finite heavy-atom coordinates");
+        sum[0] += point.x;
+        sum[1] += point.y;
+        sum[2] += point.z;
+        ++count;
+    }
+    if (!count)
+        throw std::invalid_argument("Pose center distance requires at least one heavy atom");
+    std::array<double, 3> center{};
+    for (std::size_t i = 0; i < center.size(); ++i) {
+        center[i] = static_cast<double>(sum[i] / count);
+        if (!std::isfinite(center[i]))
+            throw std::invalid_argument("Pose center distance has a nonfinite centroid");
+    }
+    return center;
+}
+
+double pose_center_distance(const std::array<double, 3>& ligand_center,
+    const RigidTransform& transform, const std::array<double, 3>& reference_center)
+{
+    for (const auto& center : {ligand_center, reference_center})
+        for (double value : center)
+            if (!std::isfinite(value))
+                throw std::invalid_argument("Pose center distance has a nonfinite centroid");
+    for (double value : transform.rotation)
+        if (!std::isfinite(value))
+            throw std::invalid_argument("Pose center distance has a nonfinite rotation");
+    std::array<double, 3> displacement{};
+    for (std::size_t i = 0; i < displacement.size(); ++i) {
+        if (!std::isfinite(transform.translation[i]))
+            throw std::invalid_argument("Pose center distance has a nonfinite translation");
+        displacement[i] = transform.rotation[3 * i] * ligand_center[0] +
+            transform.rotation[3 * i + 1] * ligand_center[1] +
+            transform.rotation[3 * i + 2] * ligand_center[2] + transform.translation[i] - reference_center[i];
+    }
+    const double distance = std::hypot(displacement[0], displacement[1], displacement[2]);
+    if (!std::isfinite(distance))
+        throw std::invalid_argument("Pose center distance is nonfinite");
+    return distance;
+}
 
 double compute_ligand_diameter(
     const std::vector<interaction::interaction_area>& ligand_areas)

@@ -1,5 +1,6 @@
 #include "gpu_docking_output.hpp"
 #include "pose_score_ranking.hpp"
+#include "geometry.hpp"
 
 #include <GraphMol/Atom.h>
 #include <GraphMol/Bond.h>
@@ -155,7 +156,7 @@ const std::vector<std::string>& extended_properties() {
 }
 
 void write_extended_scores(std::ostream& rows, RDKit::RWMol* molecule,
-                           const GpuDockingPoseScores& scores) {
+                           const GpuDockingPoseScores& scores, bool compact) {
     validate_scores(scores);
     if (molecule) {
         for (const auto& property : extended_properties())
@@ -175,19 +176,33 @@ void write_extended_scores(std::ostream& rows, RDKit::RWMol* molecule,
     const auto& vinardo = scores.vinardo;
     write_score("vinardo_like_score", vinardo
         ? std::optional<double>(vinardo->total) : std::nullopt);
-    write_score("vinardo_gaussian", vinardo
-        ? std::optional<double>(vinardo->gaussian) : std::nullopt);
-    write_score("vinardo_repulsion", vinardo
-        ? std::optional<double>(vinardo->repulsion) : std::nullopt);
-    write_score("vinardo_hydrophobic", vinardo
-        ? std::optional<double>(vinardo->hydrophobic) : std::nullopt);
-    write_score("vinardo_hydrogen_bond", vinardo
-        ? std::optional<double>(vinardo->hydrogen_bond) : std::nullopt);
+    if (!compact) {
+        write_score("vinardo_gaussian", vinardo
+            ? std::optional<double>(vinardo->gaussian) : std::nullopt);
+        write_score("vinardo_repulsion", vinardo
+            ? std::optional<double>(vinardo->repulsion) : std::nullopt);
+        write_score("vinardo_hydrophobic", vinardo
+            ? std::optional<double>(vinardo->hydrophobic) : std::nullopt);
+        write_score("vinardo_hydrogen_bond", vinardo
+            ? std::optional<double>(vinardo->hydrogen_bond) : std::nullopt);
+    }
     write_score("vinardo_adjusted_score", scores.vinardo_adjusted);
     write_score("hybrid_score", scores.hybrid);
 }
 
 } // namespace
+
+void write_gpu_docking_summary_entry(std::ostream& csv,
+    const std::string& key, const std::string& value) {
+    const auto field = [&](const std::string& text) {
+        if (text.find_first_of(",\"\r\n") != std::string::npos) csv << csv_string(text);
+        else csv << text;
+    };
+    field(key);
+    csv << ',';
+    field(value);
+    csv << '\n';
+}
 
 std::vector<GpuPipelinePose> select_top_gpu_poses(
     const std::vector<GpuPipelinePose>& poses, std::size_t k) {
@@ -200,7 +215,7 @@ std::vector<GpuPipelinePose> select_top_gpu_poses(
         const auto& pose = poses[i];
         if (!valid_pose(pose)) continue;
         require_finite_score(pose);
-        // The historical Fast tie-break is alignment ID, not survivor position.
+        // Fast ties use the original alignment ID, not the survivor position.
         scores.push_back({pose.alignment_index, pose.fast_score.weighted_score});
         originals.push_back(i);
     }
@@ -228,12 +243,111 @@ void validate_gpu_docking_reference(const RDKit::ROMol& ligand,
     validate_reference(ligand, reference);
 }
 
-void write_gpu_docking_pose_header(std::ostream& csv, bool with_rmsd, bool extended_scores) {
+std::vector<double> gpu_docking_pose_rmsds(const RDKit::ROMol& ligand,
+                                         const std::vector<GpuPipelinePose>& ranked,
+                                         const RDKit::ROMol& reference) {
+    validate_reference(ligand, reference);
+    std::vector<double> values;
+    values.reserve(ranked.size());
+    for (const auto& pose : ranked) {
+        validate_transform(pose.transform);
+        values.push_back(validated_rmsd(ligand, pose.transform, reference));
+    }
+    return values;
+}
+
+std::vector<double> gpu_docking_pose_center_distances(
+    const RDKit::ROMol& ligand, const std::vector<GpuPipelinePose>& ranked,
+    const std::array<double, 3>& reference_center, std::size_t count) {
+    if (count > ranked.size())
+        throw std::invalid_argument("Pose center distance prefix exceeds the ranked pool");
+    for (double coordinate : reference_center)
+        if (!std::isfinite(coordinate))
+            throw std::invalid_argument("Pose center distance requires a finite reference centroid");
+    const auto ligand_center = heavy_atom_centroid(ligand);
+    std::vector<double> distances;
+    distances.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& transform = ranked[i].transform;
+        validate_transform(transform);
+        RigidTransform rigid;
+        std::copy(std::begin(transform.rotation), std::end(transform.rotation), rigid.rotation.begin());
+        std::copy(std::begin(transform.translation), std::end(transform.translation), rigid.translation.begin());
+        distances.push_back(pose_center_distance(ligand_center, rigid, reference_center));
+    }
+    return distances;
+}
+
+void write_gpu_docking_pose_metrics_header(std::ostream& csv) {
+    csv << "record_index,molecule_id,candidate_pool,top1_alignment_index,top1_pose_id,"
+           "top1_fast_weighted_score,top1_weighted_interaction_score,"
+           "top1_vinardo_adjusted_score,top1_hybrid_score,top1_rmsd_heavy_A,"
+           "top5_min_rmsd_heavy_A,top10_min_rmsd_heavy_A,top20_min_rmsd_heavy_A,"
+           "best_ranked_pool_rmsd_heavy_A\n";
+    if (!csv) throw std::runtime_error("Could not write GPU docking pose metric header");
+}
+
+void write_gpu_docking_pose_metrics(std::ostream& csv,
+    const std::vector<double>& ranked_rmsds, std::size_t record_index,
+    const std::string& molecule_id, std::size_t candidate_pool,
+    const GpuPipelinePose* top_pose, const GpuDockingPoseScores* top_scores) {
+    if (!ranked_rmsds.empty() && candidate_pool && ranked_rmsds.size() != candidate_pool)
+        throw std::invalid_argument("Ranked-pool RMSD metrics require every candidate, not an export prefix");
+    for (double value : ranked_rmsds)
+        if (!std::isfinite(value) || value < 0.0)
+            throw std::invalid_argument("GPU docking ranked-pool RMSD is invalid");
+    if (top_pose) {
+        if (!valid_pose(*top_pose)) throw std::invalid_argument("GPU docking Top-1 pose is invalid");
+        require_finite_score(*top_pose);
+    }
+    if (top_scores) {
+        if (!top_pose) throw std::invalid_argument("GPU docking Top-1 scores lack a pose");
+        validate_scores(*top_scores);
+    }
+    std::ostringstream row;
+    row << std::setprecision(17) << record_index << ',' << csv_string(molecule_id)
+        << ',' << (candidate_pool ? candidate_pool : ranked_rmsds.size()) << ',';
+    if (top_pose) row << top_pose->alignment_index;
+    row << ',';
+    if (top_scores) row << top_scores->pose_id;
+    const auto score = [&](std::optional<double> value) {
+        row << ',';
+        if (value) row << *value;
+    };
+    score(top_pose ? std::optional<double>(top_pose->fast_score.weighted_score) : std::nullopt);
+    score(top_scores && top_scores->weighted_interaction
+        ? std::optional<double>(top_scores->weighted_interaction->weighted_score) : std::nullopt);
+    score(top_scores ? top_scores->vinardo_adjusted : std::nullopt);
+    score(top_scores ? top_scores->hybrid : std::nullopt);
+    const auto minimum = [&](std::size_t count) {
+        row << ',';
+        if (!ranked_rmsds.empty())
+            row << *std::min_element(ranked_rmsds.begin(),
+                ranked_rmsds.begin() + std::min(count, ranked_rmsds.size()));
+    };
+    for (std::size_t count : {1U, 5U, 10U, 20U}) minimum(count);
+    minimum(ranked_rmsds.size());
+    row << '\n';
+    csv << row.str();
+    if (!csv) throw std::runtime_error("Could not write GPU docking pose metrics");
+}
+
+void write_gpu_docking_pose_header(std::ostream& csv, bool with_rmsd, bool extended_scores,
+                                   const PoseExportOptions* export_options, bool with_center_distance) {
+    if (export_options && export_options->mode == PoseExportMode::None) return;
+    const bool compact = export_options && export_options->detail == PoseExportDetail::Compact;
     csv << "record_index,molecule_id,rank,alignment_index,fast_weighted_score,"
-           "clash_fraction,occupied_atoms,r00,r01,r02,r10,r11,r12,r20,r21,r22,tx,ty,tz";
+           "clash_fraction,occupied_atoms";
+    if (!compact) csv << ",r00,r01,r02,r10,r11,r12,r20,r21,r22,tx,ty,tz";
     if (with_rmsd) csv << ",rmsd_heavy_A";
     if (extended_scores)
-        for (const auto& property : extended_properties()) csv << ',' << property;
+        for (const auto& property : extended_properties()) {
+            if (compact && (property == "vinardo_gaussian" || property == "vinardo_repulsion" ||
+                            property == "vinardo_hydrophobic" || property == "vinardo_hydrogen_bond"))
+                continue;
+            csv << ',' << property;
+        }
+    if (with_center_distance) csv << ",center_distance_A";
     csv << '\n';
     if (!csv) throw std::runtime_error("Could not write GPU docking pose CSV header");
 }
@@ -243,9 +357,12 @@ void write_gpu_docking_poses(std::ostream& csv, std::ostream& sdf,
                             const std::vector<GpuPipelinePose>& ranked,
                             std::size_t record_index, const std::string& molecule_id,
                             bool with_rmsd, const RDKit::ROMol* reference,
-                            const std::vector<GpuDockingPoseScores>* scores) {
+                            const std::vector<GpuDockingPoseScores>* scores,
+                            const PoseExportOptions* export_options,
+                            const std::vector<double>* cached_rmsds,
+                            const std::vector<double>* center_distances) {
     write_gpu_docking_poses(csv, &sdf, ligand, ranked, record_index, molecule_id,
-                           with_rmsd, reference, scores);
+                           with_rmsd, reference, scores, export_options, cached_rmsds, center_distances);
 }
 
 void write_gpu_docking_poses(std::ostream& csv, std::ostream* sdf,
@@ -253,13 +370,30 @@ void write_gpu_docking_poses(std::ostream& csv, std::ostream* sdf,
                             const std::vector<GpuPipelinePose>& ranked,
                             std::size_t record_index, const std::string& molecule_id,
                             bool with_rmsd, const RDKit::ROMol* reference,
-                            const std::vector<GpuDockingPoseScores>* scores) {
+                            const std::vector<GpuDockingPoseScores>* scores,
+                            const PoseExportOptions* export_options,
+                            const std::vector<double>* cached_rmsds,
+                            const std::vector<double>* center_distances) {
+    if (export_options && export_options->mode == PoseExportMode::None) return;
+    if (export_options && export_options->mode == PoseExportMode::TopK && !export_options->top_k)
+        throw std::invalid_argument("GPU docking export top-k must be positive");
+    const auto count = export_options ? pose_export_count(*export_options, ranked.size()) : ranked.size();
+    const bool compact = export_options && export_options->detail == PoseExportDetail::Compact;
     if (!csv || (sdf && !*sdf)) throw std::runtime_error("GPU docking output stream is not writable");
     if (reference && !with_rmsd)
         throw std::invalid_argument("RMSD reference supplied without the RMSD output column");
     if (scores && scores->size() != ranked.size())
         throw std::invalid_argument("GPU docking export scores do not match the ranked pose count");
-    if (ranked.empty()) return;
+    if (cached_rmsds && (!with_rmsd || cached_rmsds->size() != ranked.size()))
+        throw std::invalid_argument("GPU docking cached RMSDs do not match the ranked pose count");
+    if (center_distances) {
+        if (center_distances->size() != count)
+            throw std::invalid_argument("Pose center distances do not match the exported pose count");
+        for (double distance : *center_distances)
+            if (!std::isfinite(distance) || distance < 0.0)
+                throw std::invalid_argument("Pose center distance must be finite and nonnegative");
+    }
+    if (!count) return;
     validate_coordinates(ligand);
     if (reference) validate_reference(ligand, *reference);
     // Stage a ligand's complete records before modifying the caller's streams.
@@ -273,9 +407,10 @@ void write_gpu_docking_poses(std::ostream& csv, std::ostream* sdf,
             "fast_weighted_score", "clash_fraction", "occupied_atoms", "rmsd_heavy_A"};
         if (scores) properties.insert(properties.end(), extended_properties().begin(),
                                       extended_properties().end());
+        if (center_distances) properties.push_back("center_distance_A");
         writer->setProps(properties);
     }
-    for (std::size_t i = 0; i < ranked.size(); ++i) {
+    for (std::size_t i = 0; i < count; ++i) {
         const auto& pose = ranked[i];
         if (!valid_pose(pose)) throw std::invalid_argument("Cannot export an invalid GPU docking pose");
         require_finite_score(pose);
@@ -302,21 +437,31 @@ void write_gpu_docking_poses(std::ostream& csv, std::ostream* sdf,
             molecule->setProp("occupied_atoms", std::to_string(pose.clash.occupied_atoms));
             // Remove any same-named property inherited from an input SDF molecule.
             if (molecule->hasProp("rmsd_heavy_A")) molecule->clearProp("rmsd_heavy_A");
+            if (center_distances && molecule->hasProp("center_distance_A")) molecule->clearProp("center_distance_A");
         }
         rows << record_index << ',' << csv_string(molecule_id) << ',' << i + 1 << ','
              << pose.alignment_index << ',' << pose.fast_score.weighted_score << ','
              << pose.clash.fraction << ',' << pose.clash.occupied_atoms;
-        for (double value : pose.transform.rotation) rows << ',' << value;
-        for (double value : pose.transform.translation) rows << ',' << value;
+        if (!compact) {
+            for (double value : pose.transform.rotation) rows << ',' << value;
+            for (double value : pose.transform.translation) rows << ',' << value;
+        }
         if (with_rmsd) {
             rows << ',';
-            if (reference) {
-                const double rmsd = validated_rmsd(ligand, pose.transform, *reference);
+            if (reference || cached_rmsds) {
+                const double rmsd = cached_rmsds ? cached_rmsds->at(i) :
+                    validated_rmsd(ligand, pose.transform, *reference);
+                if (!std::isfinite(rmsd) || rmsd < 0.0)
+                    throw std::invalid_argument("GPU docking cached RMSD is invalid");
                 rows << rmsd;
                 if (molecule) molecule->setProp("rmsd_heavy_A", numeric_property(rmsd));
             }
         }
-        if (scores) write_extended_scores(rows, molecule.get(), scores->at(i));
+        if (scores) write_extended_scores(rows, molecule.get(), scores->at(i), compact);
+        if (center_distances) {
+            rows << ',' << center_distances->at(i);
+            if (molecule) molecule->setProp("center_distance_A", numeric_property(center_distances->at(i)));
+        }
         rows << '\n';
         if (writer) writer->write(*molecule);
     }

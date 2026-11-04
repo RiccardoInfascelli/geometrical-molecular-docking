@@ -68,7 +68,8 @@ Options parse_args(int argc, char** argv) {
             "Usage: multi_ligand_screen_gpu <target_complex_dir> <multi.mol2> <results.csv> "
             "[--limit 30] [--cutoff 24] [--min-target-clearance A] [--single] "
             "[--rescore-output <new-directory> [--rescore-prefilter N] "
-            "[--interaction-region pocket|protein]]");
+            "[--interaction-region pocket|protein]]\n"
+            "DOCKING_QUERY_METHOD selects reference|optimized (default optimized).");
     }
     Options opts;
     opts.profile = stage_profiling_enabled();
@@ -337,6 +338,8 @@ void process_one(std::unique_ptr<RDKit::RWMol> molecule,
 int main(int argc, char** argv) {
     try {
         const Options opts = parse_args(argc, argv);
+        if (::setenv("DOCKING_QUERY_METHOD", "optimized", 0) != 0)
+            throw std::runtime_error("Could not set the CUDA screening query default");
         char program[] = "multi_ligand_screen_gpu";
         const auto target = opts.target_complex.string();
         char* target_argv[] = {program, const_cast<char*>(target.c_str())};

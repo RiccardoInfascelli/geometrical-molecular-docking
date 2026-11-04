@@ -5,6 +5,7 @@
 #include "cuda_grid.hpp"
 #include "cuda_fast_scoring.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -38,6 +39,27 @@ struct GpuClashSurvivorArrayDevice
     GpuClashScore* clash_scores{nullptr};
     std::uint32_t* alignment_indices{nullptr};
     std::uint32_t count{};
+};
+
+// Scratch owned by one serialized search context on one CUDA device. Capacity
+// is independent of the active pose count; kernels must use the latter. No
+// survivor/output allocation aliases this storage. Not safe for concurrent calls.
+// Growth failures return false; any retained capacity remains owned here.
+struct GpuClashCompactionWorkspace
+{
+    std::uint32_t* flags{nullptr};
+    std::uint32_t* offsets{nullptr};
+    std::uint32_t* valid_count{nullptr};
+    void* scan_storage{nullptr};
+    std::size_t capacity{};
+    std::size_t scan_capacity_bytes{};
+
+    GpuClashCompactionWorkspace() = default;
+    GpuClashCompactionWorkspace(const GpuClashCompactionWorkspace&) = delete;
+    GpuClashCompactionWorkspace& operator=(const GpuClashCompactionWorkspace&) = delete;
+    ~GpuClashCompactionWorkspace();
+    bool reserve(std::size_t count, std::size_t scan_bytes = 0);
+    void clear() noexcept;
 };
 
 
@@ -424,12 +446,15 @@ void cuda_free_clash_scores(
 // Keep valid transforms with valid clash scores and fraction <= threshold.
 // Preserve input order and retain original alignment indices for the survivors.
 // valid_transform_count also includes valid transforms rejected by clash.
+// Optional scratch retains capacity between completed calls. Without it the
+// same scratch is local to this call. The valid counter is reset on every call.
 bool cuda_compact_clash_survivors(
     const GpuRigidTransformArrayDevice& transforms,
     const GpuClashScoreArrayDevice& clash_scores,
     double clash_threshold,
     GpuClashSurvivorArrayDevice& survivors,
-    std::uint32_t& valid_transform_count
+    std::uint32_t& valid_transform_count,
+    GpuClashCompactionWorkspace* workspace = nullptr
 );
 
 

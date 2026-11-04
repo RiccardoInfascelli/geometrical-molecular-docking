@@ -4,6 +4,7 @@ Questo esperimento ricalcola lo scoring su pose già generate. Non modifica il
 motore e non ripete lookup, Kabsch, clash o ricerca geometrica durante l'ablation.
 Il pool rimane fisso: nessuna posa viene scartata in base a WeightedInteraction, Vinardo o RMSD.
 Non usa soltanto le Top-10 e non applica un nuovo prefilter Fast.
+Il workflow completo rimane WIP per la validazione scientifica.
 
 ## Cosa viene riutilizzato
 
@@ -18,12 +19,11 @@ Il tool usa questi scorer, `rank_rescored_poses()` e il helper host
 La build è CPU e non richiede una GPU. Il target `docking_gpu_output` usato per
 RMSD è anch'esso codice host; il nome non implica un'esecuzione CUDA.
 
-## Compilazione isolata nel container
+## Compilazione isolata
 
-Nel container con le dipendenze C++ già usate dal progetto:
+Dalla radice della repository, con le dipendenze C++ configurate:
 
 ```sh
-cd /workspace/geometric-docking
 cmake -S experiments/scoring_ablation -B experiments/scoring_ablation/build \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build experiments/scoring_ablation/build \
@@ -33,27 +33,20 @@ ctest --test-dir experiments/scoring_ablation/build --output-on-failure \
 ```
 
 Il CMake locale richiama i target esistenti in una nuova directory di build,
-con CUDA disattivato. Non modifica il CMake principale né le build precedenti.
-Il generatore esistente viene compilato in `build/engine/` soltanto per avere
-un eseguibile corrispondente agli stessi sorgenti degli scorer.
-La dipendenza attuale imposta esplicitamente `CMP0167 NEW`: serve quindi un
-CMake che riconosca quella policy (3.30 o successivo), oltre alle dipendenze già
-richieste dal progetto. Un default `CMAKE_POLICY_DEFAULT_CMP0167` non sostituisce
-quell'impostazione esplicita. Eventuali problemi dell'ambiente vanno segnalati,
-senza modificare la dipendenza per questo esperimento.
+con CUDA disattivato. Il generatore viene compilato nella sottodirectory
+`engine/` della build, dagli stessi sorgenti degli scorer. I requisiti comuni
+sono nella [guida di compilazione](../../docs/build-e-test.md).
 
 ## Prima prova su 1a1e
 
-Non essendo disponibile un CSV completo preesistente, il runner genera una sola
-volta tutte le pose tramite il percorso `--joint-output` già implementato in
+Il runner genera una sola volta tutte le pose tramite il percorso `--joint-output` di
 `vinardo_rescore_experiment`, senza `--prefilter`. Poi verifica che il numero di
 righe coincida con `input_survivors` e `exported_poses` del protocollo, e avvia
 l'ablation senza ulteriori docking. Il ligando cristallografico viene usato
 come input rigido e, separatamente, come riferimento della metrica RMSD.
 
 ```sh
-cd /workspace/geometric-docking
-bash experiments/scoring_ablation/run_1a1e.sh /workspace/datasets/refined-set/1a1e
+bash experiments/scoring_ablation/run_1a1e.sh /path/to/refined-set/1a1e
 ```
 
 La directory nuova è `experiments/scoring_ablation/runs/1a1e-<data>-<pid>/`.
@@ -73,8 +66,7 @@ a 17 cifre: ogni posa è rappresentata dal ligando originale e dalla sua matrice
 R e traslazione t. `generation/protocol.csv` conserva impostazioni, conteggi e
 tempi della generazione. Gli originali non vengono copiati o trasformati sul
 disco. `commands.txt`, stdout e stderr dei due programmi restano nella nuova
-directory. Non si producono percentuali scientifiche finché la prova non è stata
-eseguita e verificata.
+directory.
 
 ## Rianalizzare lo stesso pool
 
@@ -84,10 +76,10 @@ dopo avere impostato `RUN` alla directory appena prodotta:
 ```sh
 POOL_SIZE=$(python3 -c 'import csv,sys; p=dict(csv.reader(open(sys.argv[1], newline=""))); print(p["exported_poses"])' "$RUN/generation/protocol.csv")
 experiments/scoring_ablation/build/scoring_ablation \
-  --complex /workspace/datasets/refined-set/1a1e \
+  --complex /path/to/refined-set/1a1e \
   --poses "$RUN/generation/poses.csv" --pool-size "$POOL_SIZE" \
   --pool-kind all-survivors --interaction-region pocket \
-  --reference /workspace/datasets/refined-set/1a1e/1a1e_ligand.mol2 \
+  --reference /path/to/refined-set/1a1e/1a1e_ligand.mol2 \
   --vinardo-alpha 0.5 --hybrid-lambda 0.3 \
   --output "$RUN/ablation-rep50"
 ```
@@ -135,10 +127,12 @@ repulsione elimina l'intero contributo repulsivo ridotto; non lo sottrae due vol
 Vinardo resta un prototipo Vinardo-like, non un'affinità validata in kcal/mol.
 
 WeightedInteraction valuta per default le aree appartenenti alla pocket secondo il criterio
-standard di `RescoringTarget`. `--interaction-region protein` usa tutte le aree. Nessun
-crop a 8 Å viene introdotto. Vinardo usa sempre la proteina completa supportata
-e il cutoff atomico stretto di 8 Å già presente nello scorer. Un CSV generato
-con crop o pesi diversi non è automaticamente compatibile con questa baseline.
+standard di `RescoringTarget`; `--interaction-region protein` usa tutte le aree rilevate.
+Il tool e il runner ereditano `DOCKING_AREA_CROP_MARGIN_A`: per il protocollo senza
+crop la variabile deve essere assente. Se impostata, il crop chimico deve essere
+identico a quello usato nella generazione ed è registrato nel protocollo.
+Vinardo usa sempre la proteina completa supportata e il cutoff atomico stretto
+di 8 Å. Un pool generato con regioni o pesi diversi non è automaticamente compatibile.
 
 ## Ranking, RMSD e interpretazione
 
@@ -178,7 +172,7 @@ Una sola ablation su 1a1e è un controllo esplorativo, non una stima generale
 dell'importanza dei termini. Per pochi altri complessi si ripete il runner,
 senza cambiare simultaneamente campionamento, scoring e parametri.
 
-## Controlli predisposti e stato della verifica
+## Test e limiti
 
 Il test sintetico copre il massimo WeightedInteraction fra due famiglie sulla stessa area,
 componenti Vinardo e alpha, cancellazione numerica, pool fisso e nuova Top-1
@@ -192,11 +186,6 @@ Non esegue scoring né apre dati scientifici. Può essere eseguito anche senza R
 python3 experiments/scoring_ablation/workflow_test.py
 ```
 
-Durante questa implementazione non sono stati compilati o eseguiti i test C++
-né il docking reale. Gli eseguibili preesistenti controllati sul Mac sono ELF
-Linux aarch64 e non sono eseguibili macOS; non risultano header RDKit nei percorsi
-Homebrew standard controllati. La prova minima è quindi predisposta per il
-container, senza tentare di accedervi o installare dipendenze.
-Sono invece passati i cinque test Python del flusso con dati sintetici, il
-controllo sintattico Bash del runner e `git diff --check`. Questi controlli non
-validano la compilazione C++ né dimostrano un risultato scientifico su 1a1e.
+I controlli sintetici non misurano l'importanza dei termini su un dataset.
+Prima di interpretare il replay verificare il pool completo, il protocollo
+di generazione e l'accordo degli score salvati con il rescoring.

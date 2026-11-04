@@ -2,6 +2,7 @@
 #define CUDA_WEIGHTED_INTERACTION_SCORING_HPP
 
 #include "cuda_triplet_types.hpp"
+#include "cuda_scoring_range.hpp"
 
 #include <cstdint>
 #include <vector>
@@ -74,6 +75,16 @@ bool cuda_score_weighted_interaction_device(
     const GpuWeightedInteractionAreasDevice& protein, const GpuWeightedInteractionAreasDevice& ligand,
     const GpuRigidTransformArrayDevice& transforms,
     const std::uint32_t* selected_pose_ids, std::uint32_t selected_count,
+    const GpuWeightedInteractionWeights& weights, GpuWeightedInteractionScoresDevice& output);
+
+// Score concatenated ligands with local selected survivor IDs. Each device
+// range follows selection order and identifies its ligand's physical areas
+// and transform offset. Invalid ranges produce invalid score rows.
+bool cuda_score_weighted_interaction_batch_device(
+    const GpuWeightedInteractionAreasDevice& protein, const GpuWeightedInteractionAreasDevice& ligand,
+    const GpuRigidTransformArrayDevice& transforms,
+    const std::uint32_t* selected_pose_ids, std::uint32_t selected_count,
+    const GpuLigandScoringRange* selected_ranges,
     const GpuWeightedInteractionWeights& weights, GpuWeightedInteractionScoresDevice& output);
 
 #endif

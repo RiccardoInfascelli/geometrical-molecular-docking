@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 
 namespace
@@ -113,13 +114,70 @@ __global__ void scatter_clash_survivors_kernel(
 
 } // namespace
 
+void GpuClashCompactionWorkspace::clear() noexcept
+{
+    if (scan_storage) cudaFree(scan_storage);
+    if (valid_count) cudaFree(valid_count);
+    if (offsets) cudaFree(offsets);
+    if (flags) cudaFree(flags);
+    scan_storage = nullptr;
+    valid_count = offsets = flags = nullptr;
+    capacity = scan_capacity_bytes = 0;
+}
+
+GpuClashCompactionWorkspace::~GpuClashCompactionWorkspace() { clear(); }
+
+bool GpuClashCompactionWorkspace::reserve(std::size_t count, std::size_t scan_bytes)
+{
+    if (count > static_cast<std::size_t>(INT_MAX) ||
+        count > std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t))
+        return false;
+    if (count == 0) return scan_bytes == 0;
+
+    if (count > capacity) {
+        std::uint32_t* replacement_flags = nullptr;
+        std::uint32_t* replacement_offsets = nullptr;
+        const auto bytes = count * sizeof(std::uint32_t);
+        if (cudaMalloc(reinterpret_cast<void**>(&replacement_flags), bytes) != cudaSuccess)
+            return false;
+        if (cudaMalloc(reinterpret_cast<void**>(&replacement_offsets), bytes) != cudaSuccess) {
+            cudaFree(replacement_flags);
+            return false;
+        }
+        // Both new arrays exist before replacing the old pair. Failed growth
+        // never leaves the workspace pointing at a partially allocated pair.
+        auto* old_flags = flags;
+        auto* old_offsets = offsets;
+        flags = replacement_flags;
+        offsets = replacement_offsets;
+        capacity = count;
+        bool freed = true;
+        if (old_offsets && cudaFree(old_offsets) != cudaSuccess) freed = false;
+        if (old_flags && cudaFree(old_flags) != cudaSuccess) freed = false;
+        if (!freed) return false;
+    }
+    if (!valid_count &&
+        cudaMalloc(reinterpret_cast<void**>(&valid_count), sizeof(std::uint32_t)) != cudaSuccess)
+        return false;
+    if (scan_bytes > scan_capacity_bytes) {
+        void* replacement = nullptr;
+        if (cudaMalloc(&replacement, scan_bytes) != cudaSuccess) return false;
+        void* previous = scan_storage;
+        scan_storage = replacement;
+        scan_capacity_bytes = scan_bytes;
+        if (previous && cudaFree(previous) != cudaSuccess) return false;
+    }
+    return true;
+}
+
 
 bool cuda_compact_clash_survivors(
     const GpuRigidTransformArrayDevice& transforms,
     const GpuClashScoreArrayDevice& clash_scores,
     double clash_threshold,
     GpuClashSurvivorArrayDevice& survivors,
-    std::uint32_t& valid_transform_count
+    std::uint32_t& valid_transform_count,
+    GpuClashCompactionWorkspace* workspace
 )
 {
     cuda_free_clash_survivors(
@@ -171,17 +229,12 @@ bool cuda_compact_clash_survivors(
     }
 
 
-    std::uint32_t* device_flags =
-        nullptr;
-
-    std::uint32_t* device_offsets =
-        nullptr;
-
-    std::uint32_t* device_valid_count =
-        nullptr;
-
-    void* device_scan_storage =
-        nullptr;
+    GpuClashCompactionWorkspace local_workspace;
+    auto& scratch = workspace ? *workspace : local_workspace;
+    if (!scratch.reserve(transforms.count)) return false;
+    auto* device_flags = scratch.flags;
+    auto* device_offsets = scratch.offsets;
+    auto* device_valid_count = scratch.valid_count;
 
 
     GpuRigidTransform*
@@ -211,58 +264,7 @@ bool cuda_compact_clash_survivors(
             cudaFree(
                 device_survivor_transforms
             );
-
-            cudaFree(
-                device_scan_storage
-            );
-
-            cudaFree(
-                device_valid_count
-            );
-
-            cudaFree(
-                device_offsets
-            );
-
-            cudaFree(
-                device_flags
-            );
         };
-
-
-    const std::size_t flag_bytes =
-        static_cast<std::size_t>(
-            transforms.count
-        ) *
-        sizeof(std::uint32_t);
-
-
-    if (
-        cudaMalloc(
-            reinterpret_cast<void**>(
-                &device_flags
-            ),
-            flag_bytes
-        ) != cudaSuccess ||
-
-        cudaMalloc(
-            reinterpret_cast<void**>(
-                &device_offsets
-            ),
-            flag_bytes
-        ) != cudaSuccess ||
-
-        cudaMalloc(
-            reinterpret_cast<void**>(
-                &device_valid_count
-            ),
-            sizeof(std::uint32_t)
-        ) != cudaSuccess
-    ) {
-        cleanup();
-
-        return false;
-    }
 
 
     if (
@@ -332,24 +334,15 @@ bool cuda_compact_clash_survivors(
     }
 
 
-    if (scan_storage_bytes != 0) {
-
-        if (
-            cudaMalloc(
-                &device_scan_storage,
-                scan_storage_bytes
-            ) != cudaSuccess
-        ) {
-            cleanup();
-
-            return false;
-        }
+    if (!scratch.reserve(transforms.count, scan_storage_bytes)) {
+        cleanup();
+        return false;
     }
 
 
     if (
         cub::DeviceScan::ExclusiveSum(
-            device_scan_storage,
+            scratch.scan_storage,
             scan_storage_bytes,
             device_flags,
             device_offsets,

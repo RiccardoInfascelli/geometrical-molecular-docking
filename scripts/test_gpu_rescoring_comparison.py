@@ -60,6 +60,22 @@ class ComparisonTest(unittest.TestCase):
         self.assertTrue(result["full_pool_exported"])
         self.assertEqual(result["compared_poses"], 2)
 
+    def test_explicit_all_export_ignores_the_topk_serialization_limit(self):
+        self.summary.update(top_k="1", pose_output="all", pose_detail="full")
+        self.save()
+        result = self.compare()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["full_pool_exported"])
+        self.assertEqual(result["compared_poses"], 2)
+
+    def test_reduced_exports_are_rejected_explicitly(self):
+        for mode, detail in (("none", "full"), ("topk", "compact")):
+            with self.subTest(mode=mode, detail=detail):
+                self.summary.update(pose_output=mode, pose_detail=detail)
+                self.save()
+                with self.assertRaisesRegex(ValueError, "Pose comparison requires"):
+                    self.compare()
+
     def test_tolerated_roundoff_and_report(self):
         for field, change in (("vinardo_like_score", 1e-9), ("hybrid_score", 1e-10)):
             with self.subTest(field=field):

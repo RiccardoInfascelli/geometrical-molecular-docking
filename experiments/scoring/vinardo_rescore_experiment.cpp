@@ -4,6 +4,8 @@
 #include "ligand_preparation.hpp"
 #include "pose_rescoring.hpp"
 #include "protein_preparation.hpp"
+#include "joint_diagnostics.hpp"
+#include "gpu_docking_output.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -13,7 +15,9 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,12 +38,49 @@ double elapsed(Clock::time_point start) {
     return std::chrono::duration<double>(Clock::now() - start).count();
 }
 
+void write_diagnostic_status(const fs::path& output, const std::string& status,
+    const std::string& stage, const std::string& message,
+    std::optional<std::size_t> survivors, double wall_seconds) {
+    std::ofstream csv(output / "status.csv");
+    csv.exceptions(std::ios::badbit | std::ios::failbit);
+    csv << "key,value\n";
+    write_gpu_docking_summary_entry(csv, "status", status);
+    write_gpu_docking_summary_entry(csv, "stage", stage);
+    write_gpu_docking_summary_entry(csv, "message", message);
+    write_gpu_docking_summary_entry(csv, "input_survivors", survivors ? std::to_string(*survivors) : "");
+    write_gpu_docking_summary_entry(csv, "completed", status == "ok" || status == "no_poses" ? "1" : "0");
+    std::ostringstream seconds;
+    seconds << std::setprecision(17) << wall_seconds;
+    write_gpu_docking_summary_entry(csv, "wall_before_status_s", seconds.str());
+}
+
+void write_joint_protocol(std::ostream& csv, const RunConfig& config,
+    bool full_protein, std::optional<std::size_t> prefilter, bool diagnostics) {
+    if (!diagnostics) {
+        write_rescoring_protocol(csv, config, full_protein, prefilter);
+        return;
+    }
+    std::ostringstream original;
+    write_rescoring_protocol(original, config, full_protein, prefilter);
+    std::istringstream rows(original.str());
+    std::string row;
+    while (std::getline(rows, row)) {
+        if (row.starts_with("rmsd,")) {
+            write_gpu_docking_summary_entry(csv, "rmsd",
+                "direct heavy atoms; verified fixed atom indices; no alignment or symmetry correction; evaluation only");
+        } else {
+            csv << row << '\n';
+        }
+    }
+}
+
 // This explicit mode leaves the positional top-N experiment below unchanged.
 int run_joint_scoring(int argc, char* argv[]) {
     if (argc < 4) {
         throw std::runtime_error(
             "Usage: vinardo_rescore_experiment <complex> --joint-output <new-directory> "
-            "[--prefilter N] [--interaction-region pocket|protein] [--cutoff 24]");
+            "[--prefilter N] [--interaction-region pocket|protein] [--cutoff 24] "
+            "[--diagnostics [--reference crystal.mol2]]");
     }
     char* config_args[]{argv[0], argv[1]};
     const auto config = parse_run_config(2, config_args);
@@ -47,8 +88,14 @@ int run_joint_scoring(int argc, char* argv[]) {
     std::optional<std::size_t> prefilter;
     bool full_protein = false;
     double cutoff = 24.0;
+    bool diagnostics = false;
+    fs::path reference_path;
     for (int i = 4; i < argc; ++i) {
         const std::string flag = argv[i];
+        if (flag == "--diagnostics") {
+            diagnostics = true;
+            continue;
+        }
         if (i + 1 >= argc) throw std::runtime_error("Missing value for " + flag);
         const std::string value = argv[++i];
         if (flag == "--prefilter") {
@@ -60,6 +107,8 @@ int run_joint_scoring(int argc, char* argv[]) {
             if (value != "pocket" && value != "protein")
                 throw std::runtime_error("--interaction-region must be pocket or protein");
             full_protein = value == "protein";
+        } else if (flag == "--reference") {
+            reference_path = value;
         } else if (flag == "--cutoff") {
             std::size_t consumed = 0;
             cutoff = std::stod(value, &consumed);
@@ -69,77 +118,178 @@ int run_joint_scoring(int argc, char* argv[]) {
             throw std::runtime_error("Invalid argument: " + flag);
         }
     }
+    if (diagnostics && prefilter)
+        throw std::runtime_error("--diagnostics evaluates the full pool and Fast Top-500; omit --prefilter");
+    if (!diagnostics && !reference_path.empty())
+        throw std::runtime_error("--reference requires --diagnostics");
     if (fs::exists(output))
         throw std::runtime_error("Output directory already exists: " + output.string());
     fs::create_directories(output);
 
-    auto start = Clock::now();
-    const auto protein = prepare_protein(config);
-    const double target_s = elapsed(start);
+    const auto wall_start = Clock::now();
+    std::string stage = "preparation";
+    bool invalid_reference = false;
+    std::optional<std::size_t> survivors;
+    try {
+        std::unique_ptr<RDKit::RWMol> reference;
+        double reference_s = 0.0;
+        if (diagnostics) {
+            stage = "reference_loading";
+            const auto reference_start = Clock::now();
+            try {
+                if (reference_path.empty()) reference_path = config.ligand_path;
+                reference = load_ligand(reference_path.string());
+                validate_gpu_docking_reference(*reference, *reference);
+            } catch (...) {
+                invalid_reference = true;
+                throw;
+            }
+            reference_s = elapsed(reference_start);
+        }
 
-    start = Clock::now();
-    auto molecule = load_ligand(config.ligand_path.string());
-    PreparedLigand ligand;
-    prepare_ligand(*molecule, ligand);
-    const double ligand_s = elapsed(start);
+        stage = "protein_preparation";
+        auto start = Clock::now();
+        const auto protein = prepare_protein(config);
+        const double target_s = elapsed(start);
 
-    start = Clock::now();
-    const bool shared = ligand.diameter <= cutoff;
-    const auto hash = build_protein_triplet_hash_table(
-        protein.targets, shared ? cutoff : ligand.diameter, config.triplet_bin_size);
-    const auto index = flatten_protein_triplet_index(hash);
-    const double index_s = elapsed(start);
+        stage = "ligand_preparation";
+        start = Clock::now();
+        auto molecule = load_ligand(config.ligand_path.string());
+        PreparedLigand ligand;
+        prepare_ligand(*molecule, ligand);
+        const double ligand_s = elapsed(start);
 
-    start = Clock::now();
-    // Only evaluation diagnostics are skipped: every operational clash survivor
-    // is retained before the optional, explicitly requested scoring prefilter.
-    const auto generated = generate_candidate_poses_from_index(
-        *molecule, ligand.matching_areas, ligand.triplets, protein.targets,
-        protein.grid, index, config.triplet_bin_size,
-        config.operational_clash_threshold, config.clash_thresholds, true);
-    const double generation_s = elapsed(start);
+        if (diagnostics) {
+            stage = "reference_validation";
+            start = Clock::now();
+            try {
+                validate_gpu_docking_reference(*molecule, *reference);
+            } catch (...) {
+                invalid_reference = true;
+                throw;
+            }
+            reference_s += elapsed(start);
+        }
 
-    start = Clock::now();
-    const RescoringTarget target(config, full_protein);
-    const double scoring_target_s = elapsed(start);
-    const auto scores = rescore_poses(
-        generated.surviving_poses, *molecule, ligand, protein.grid,
-        target.interaction_areas, target.vinardo, prefilter);
+        stage = "index_build";
+        start = Clock::now();
+        const bool shared = ligand.diameter <= cutoff;
+        const auto hash = build_protein_triplet_hash_table(
+            protein.targets, shared ? cutoff : ligand.diameter, config.triplet_bin_size);
+        const auto index = flatten_protein_triplet_index(hash);
+        const double index_s = elapsed(start);
 
-    std::ofstream csv(output / "poses.csv");
-    csv.exceptions(std::ios::badbit | std::ios::failbit);
-    write_pose_scores_csv(csv, scores, 1);
-    csv.close();
-    std::ofstream summary(output / "protocol.csv");
-    summary.exceptions(std::ios::badbit | std::ios::failbit);
-    write_rescoring_protocol(summary, config, full_protein, prefilter);
-    summary << std::setprecision(17)
-            << "backend,cpu\nfast_source,cpu_rescoring\n"
-            << "cpu_generation_diagnostics,screening_only forced true; RMSD and unweighted grid support skipped\n"
-            << "index_policy,shared_cutoff_with_ligand_diameter_fallback\n"
-            << "index_cutoff_A," << cutoff << '\n'
-            << "protein_index_mode," << (shared ? "shared" : "fallback") << '\n'
-            << "effective_index_cutoff_A," << (shared ? cutoff : ligand.diameter) << '\n'
-            << "protein_triplet_records," << index.records.size() << '\n'
-            << "candidate_matches," << generated.total_candidate_matches << '\n'
-            << "transforms_generated," << generated.transforms_generated << '\n'
-            << "input_survivors," << scores.input_pose_count << '\n'
-            << "exported_poses," << scores.poses.size() << '\n'
-            << "target_preparation_s," << target_s << '\n'
-            << "ligand_preparation_s," << ligand_s << '\n'
-            << "index_build_s," << index_s << '\n'
-            << "pose_generation_s," << generation_s << '\n'
-            << "gpu_to_cpu_s,0\n"
-            << "scoring_target_preparation_s," << scoring_target_s << '\n'
-            << "fast_scoring_s," << scores.fast_scoring_seconds << '\n'
-            << "prefilter_s," << scores.selection_seconds << '\n'
-            << "weighted_interaction_scoring_s," << scores.weighted_interaction_scoring_seconds << '\n'
-            << "vinardo_scoring_s," << scores.vinardo_scoring_seconds << '\n'
-            << "vinardo_skipped_receptor_atoms," << target.vinardo.receptor_skipped_unsupported() << '\n';
-    summary.close();
-    std::cout << "Joint scores: " << scores.poses.size() << " / "
-              << scores.input_pose_count << " clash survivors; output " << output << '\n';
-    return 0;
+        stage = "pose_generation";
+        start = Clock::now();
+        // Only evaluation diagnostics are skipped: every operational clash survivor
+        // is retained before the optional, explicitly requested scoring prefilter.
+        const auto generated = generate_candidate_poses_from_index(
+            *molecule, ligand.matching_areas, ligand.triplets, protein.targets,
+            protein.grid, index, config.triplet_bin_size,
+            config.operational_clash_threshold, config.clash_thresholds, true);
+        const double generation_s = elapsed(start);
+        survivors = generated.surviving_poses.size();
+
+        stage = "scoring";
+        start = Clock::now();
+        const RescoringTarget target(config, full_protein);
+        const double scoring_target_s = elapsed(start);
+        const auto scores = rescore_poses(
+            generated.surviving_poses, *molecule, ligand, protein.grid,
+            target.interaction_areas, target.vinardo, prefilter);
+
+        std::vector<joint_diagnostics::PoseMetrics> metrics;
+        double metrics_s = 0.0;
+        if (diagnostics) {
+            stage = "pose_metrics";
+            start = Clock::now();
+            metrics = joint_diagnostics::evaluate_pose_metrics(scores, *molecule, *reference);
+            metrics_s = elapsed(start);
+        }
+
+        stage = "export";
+        start = Clock::now();
+        std::ofstream csv(output / "poses.csv");
+        csv.exceptions(std::ios::badbit | std::ios::failbit);
+        if (diagnostics) joint_diagnostics::write_pose_csv(csv, scores, metrics);
+        else write_pose_scores_csv(csv, scores, 1);
+        csv.close();
+        const double pose_export_s = elapsed(start);
+        double ranking_export_s = 0.0;
+        if (diagnostics) {
+            stage = "ranking_analysis_export";
+            start = Clock::now();
+            std::ofstream rankings(output / "rankings.csv"), topk(output / "topk_metrics.csv"),
+                analysis(output / "summary.csv");
+            for (auto* file : {&rankings, &topk, &analysis})
+                file->exceptions(std::ios::badbit | std::ios::failbit);
+            joint_diagnostics::write_analysis_csvs(rankings, topk, analysis, scores, metrics);
+            rankings.close();
+            topk.close();
+            analysis.close();
+            ranking_export_s = elapsed(start);
+        }
+        stage = "protocol_export";
+        std::ofstream summary(output / "protocol.csv");
+        summary.exceptions(std::ios::badbit | std::ios::failbit);
+        write_joint_protocol(summary, config, full_protein, prefilter, diagnostics);
+        summary << std::setprecision(17)
+                << "backend,cpu\nfast_source,cpu_rescoring\n"
+                << "cpu_generation_diagnostics,screening_only forced true; RMSD and unweighted grid support skipped\n"
+                << "index_policy,shared_cutoff_with_ligand_diameter_fallback\n"
+                << "index_cutoff_A," << cutoff << '\n'
+                << "protein_index_mode," << (shared ? "shared" : "fallback") << '\n'
+                << "effective_index_cutoff_A," << (shared ? cutoff : ligand.diameter) << '\n'
+                << "protein_triplet_records," << index.records.size() << '\n'
+                << "candidate_matches," << generated.total_candidate_matches << '\n'
+                << "transforms_generated," << generated.transforms_generated << '\n'
+                << "input_survivors," << scores.input_pose_count << '\n'
+                << "exported_poses," << scores.poses.size() << '\n'
+                << "target_preparation_s," << target_s << '\n'
+                << "ligand_preparation_s," << ligand_s << '\n'
+                << "index_build_s," << index_s << '\n'
+                << "pose_generation_s," << generation_s << '\n'
+                << "gpu_to_cpu_s,0\n"
+                << "scoring_target_preparation_s," << scoring_target_s << '\n'
+                << "fast_scoring_s," << scores.fast_scoring_seconds << '\n'
+                << "prefilter_s," << scores.selection_seconds << '\n'
+                << "weighted_interaction_scoring_s," << scores.weighted_interaction_scoring_seconds << '\n'
+                << "vinardo_scoring_s," << scores.vinardo_scoring_seconds << '\n'
+                << "vinardo_skipped_receptor_atoms," << target.vinardo.receptor_skipped_unsupported() << '\n';
+        if (diagnostics) {
+            write_gpu_docking_summary_entry(summary, "diagnostics", "full and fast_top500; one search and one atomic rescoring");
+            write_gpu_docking_summary_entry(summary, "reference_path", reference_path.string());
+            write_gpu_docking_summary_entry(summary, "reference_atom_mapping", "fixed indices; complete atom and bond graph checked including explicit H; no symmetry permutations");
+            write_gpu_docking_summary_entry(summary, "ranking_tie_break", "score then original pose_id ascending; shared rank_rescored_poses, not legacy rank_poses ties");
+            write_gpu_docking_summary_entry(summary, "hybrid_normalization_pool", "separate population z-scores for full_pool and fast_top500 before Top-20 selection");
+            summary << "vinardo_standard_alpha,1\nvinardo_rep50_alpha,0.5\nhybrid_alpha,0.5\nhybrid_lambda,0.3\n"
+                    << "fast_subset_size,500\nexport_top_k,20\n"
+                    << "success_rmsd_2_A,strict less than 2\nsuccess_rmsd_3_A,strict less than 3\n"
+                    << "success_center_5_A,strict less than 5\n"
+                    << "protein_targets," << protein.targets.size() << '\n'
+                    << "ligand_diameter_A," << ligand.diameter << '\n'
+                    << "reference_preparation_s," << reference_s << '\n'
+                    << "pose_metrics_s," << metrics_s << '\n'
+                    << "poses_export_s," << pose_export_s << '\n'
+                    << "ranking_analysis_export_s," << ranking_export_s << '\n';
+        }
+        summary.close();
+        if (diagnostics) write_diagnostic_status(output, scores.poses.empty() ? "no_poses" : "ok",
+            "complete", "", survivors, elapsed(wall_start));
+        std::cout << "Joint scores: " << scores.poses.size() << " / "
+                  << scores.input_pose_count << " clash survivors; output " << output << '\n';
+        return 0;
+    } catch (const std::exception& error) {
+        if (diagnostics) {
+            try {
+                write_diagnostic_status(output, invalid_reference ? "invalid_reference" : "error",
+                    stage, error.what(), survivors, elapsed(wall_start));
+            } catch (const std::exception& status_error) {
+                std::cerr << "Cannot write diagnostic status: " << status_error.what() << '\n';
+            }
+        }
+        throw;
+    }
 }
 
 } // namespace

@@ -1,6 +1,8 @@
 #ifndef RUN_CONFIG_HPP
 #define RUN_CONFIG_HPP
 
+#include "pose_export.hpp"
+
 #include <array>
 #include <cstddef>
 #include <filesystem>
@@ -30,6 +32,13 @@ struct RunConfig
 
     OutputMode output_mode =
         OutputMode::Summary;
+
+    // Export only; these options never change the pose pool or ranking.
+    PoseExportOptions pose_export;
+    bool export_structures = true;
+    bool export_timings = false;
+    bool pose_center_distance = false;
+    std::filesystem::path center_reference_mol2;
 
     // Grid
     double grid_voxel_size =
@@ -70,5 +79,9 @@ RunConfig parse_run_config(
     int argc,
     char* argv[]
 );
+
+// Call only from geometric_docking before alignment. Preserve an explicit
+// environment selector; other applications and direct APIs keep their policy.
+void apply_cpu_docking_environment();
 
 #endif

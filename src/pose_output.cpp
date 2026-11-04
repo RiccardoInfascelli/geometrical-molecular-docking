@@ -7,9 +7,12 @@
 #include <Geometry/point.h>
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -17,6 +20,21 @@
 
 namespace
 {
+
+struct PoseCenters {
+    std::array<double, 3> ligand, reference;
+};
+
+std::unique_ptr<RDKit::RWMol> load_center_reference(const std::filesystem::path& path) {
+    Mol2Reader reader(path);
+    std::string block, name;
+    if (!reader.next(block, name))
+        throw std::invalid_argument("Pose center reference contains no MOL2 record");
+    auto reference = parse_ligand_mol2_block(block);
+    if (reader.next(block, name))
+        throw std::invalid_argument("Pose center reference must contain exactly one MOL2 record");
+    return reference;
+}
 
 std::string rank_string(
     std::size_t rank)
@@ -100,7 +118,9 @@ RDKit::RWMol transformed_ligand(
 void write_ranking_csv(
     const std::filesystem::path& path,
     const std::vector<RankedPoseDiagnostic>& poses,
-    std::size_t count)
+    std::size_t count,
+    std::optional<PoseExportDetail> detail,
+    const PoseCenters* centers)
 {
     std::ofstream file(
         path
@@ -115,21 +135,21 @@ void write_ranking_csv(
     }
 
 
-    file
-        << "rank,"
-        << "rmsd,"
-        << "weighted_interaction_score,"
-        << "interaction_count,"
-        << "satisfied_ligand_areas,"
-        << "fast_weighted_score,"
-        << "grid_compatible_areas,"
-        << "occupied_atoms,"
-        << "clash_fraction"
-        << '\n';
-
-
-    file
-        << std::setprecision(10);
+    const bool compact = detail == PoseExportDetail::Compact;
+    const bool full = detail == PoseExportDetail::Full;
+    if (compact) {
+        file << "rank,rmsd,weighted_interaction_score,fast_weighted_score,"
+                "occupied_atoms,clash_fraction";
+    } else {
+        file << "rank,rmsd,weighted_interaction_score,interaction_count,"
+                "satisfied_ligand_areas,fast_weighted_score,grid_compatible_areas,"
+                "occupied_atoms,clash_fraction";
+    }
+    if (full) {
+        file << ",r00,r01,r02,r10,r11,r12,r20,r21,r22,tx,ty,tz";
+    }
+    if (centers) file << ",center_distance_A";
+    file << '\n' << std::setprecision(detail ? 17 : 10);
 
 
     for (
@@ -141,33 +161,22 @@ void write_ranking_csv(
             poses[i];
 
 
-        file
-            << (i + 1)
-            << ','
-
-            << pose.rmsd
-            << ','
-
-            << pose.weighted_interaction_score.weighted_score
-            << ','
-
-            << pose.weighted_interaction_score.total_interactions
-            << ','
-
-            << pose.weighted_interaction_score.satisfied_ligand_areas
-            << ','
-
-            << pose.fast_weighted_score
-            << ','
-
-            << pose.compatible_areas
-            << ','
-
-            << pose.occupied_atoms
-            << ','
-
-            << pose.clash_fraction
-            << '\n';
+        file << i + 1 << ',' << pose.rmsd << ','
+             << pose.weighted_interaction_score.weighted_score;
+        if (!compact) {
+            file << ',' << pose.weighted_interaction_score.total_interactions
+                 << ',' << pose.weighted_interaction_score.satisfied_ligand_areas;
+        }
+        file << ',' << pose.fast_weighted_score;
+        if (!compact) file << ',' << pose.compatible_areas;
+        file << ',' << pose.occupied_atoms << ',' << pose.clash_fraction;
+        if (full) {
+            for (const double value : pose.transform.rotation) file << ',' << value;
+            for (const double value : pose.transform.translation) file << ',' << value;
+        }
+        if (centers)
+            file << ',' << pose_center_distance(centers->ligand, pose.transform, centers->reference);
+        file << '\n';
     }
 }
 
@@ -253,6 +262,23 @@ void save_pose_outputs(
     const RunConfig& config,
     std::size_t top_n)
 {
+    std::unique_ptr<RDKit::RWMol> ligand;
+    std::optional<PoseCenters> centers;
+    if (config.pose_center_distance) {
+        if (config.center_reference_mol2.empty())
+            throw std::invalid_argument("Pose center distance requires an explicit reference MOL2 file");
+        ligand = load_ligand(config.ligand_path.string());
+        const auto reference = load_center_reference(config.center_reference_mol2);
+        centers = PoseCenters{heavy_atom_centroid(*ligand), heavy_atom_centroid(*reference)};
+    }
+    if (config.pose_export.mode == PoseExportMode::None) return;
+
+    const auto& ranking = result.pose_ranking.weighted_interaction_ranking;
+    auto export_options = config.pose_export;
+    // Keep the existing top_n argument meaningful for experimental callers.
+    export_options.top_k = top_n;
+    const std::size_t pose_count = pose_export_count(export_options, ranking.size());
+
     const std::filesystem::path
         output_directory =
             config.output_directory /
@@ -262,6 +288,12 @@ void save_pose_outputs(
     std::filesystem::create_directories(
         output_directory
     );
+
+    if (!config.export_structures) {
+        write_ranking_csv(output_directory / "ranking.csv", ranking, pose_count,
+                          config.pose_export.detail, centers ? &*centers : nullptr);
+        return;
+    }
 
 
     // ========================================================
@@ -299,10 +331,7 @@ void save_pose_outputs(
     // Load crystal ligand once
     // ========================================================
 
-    const auto ligand =
-        load_ligand(
-            config.ligand_path.string()
-        );
+    if (!ligand) ligand = load_ligand(config.ligand_path.string());
 
 
     RDKit::MolToPDBFile(
@@ -312,22 +341,6 @@ void save_pose_outputs(
             "crystal_ligand.pdb"
         ).string()
     );
-
-
-    // ========================================================
-    // Final ranking only
-    // ========================================================
-
-    const auto& ranking =
-        result.pose_ranking
-            .weighted_interaction_ranking;
-
-
-    const std::size_t pose_count =
-        std::min(
-            top_n,
-            ranking.size()
-        );
 
 
     // ========================================================
@@ -371,7 +384,9 @@ void save_pose_outputs(
         output_directory /
             "ranking.csv",
         ranking,
-        pose_count
+        pose_count,
+        config.pose_export.detail,
+        centers ? &*centers : nullptr
     );
 
 

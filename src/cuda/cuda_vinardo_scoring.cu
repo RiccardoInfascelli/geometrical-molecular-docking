@@ -25,19 +25,32 @@ __global__ void vinardo_score_kernel(
     const GpuVinardoAtom* ligand, std::uint32_t ligand_count,
     const GpuRigidTransform* transforms, std::uint32_t transform_count,
     const std::uint32_t* selected_ids, std::uint32_t selected_count,
+    const GpuLigandScoringRange* selected_ranges,
     GpuVinardoScore* output)
 {
     const std::uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= selected_count) return;
-    const std::uint32_t pose_id = selected_ids ? selected_ids[index] : index;
+    std::uint32_t pose_id = selected_ids ? selected_ids[index] : index;
     GpuVinardoScore score{};
+    std::uint32_t ligand_begin = 0;
+    if (selected_ranges) {
+        const auto range = selected_ranges[index];
+        if (range.begin > ligand_count || range.count > ligand_count - range.begin ||
+            range.pose_begin > transform_count || pose_id >= transform_count - range.pose_begin) {
+            output[index] = score;
+            return;
+        }
+        ligand_begin = range.begin;
+        ligand_count = range.count;
+        pose_id += range.pose_begin;
+    }
     if (pose_id >= transform_count || !transforms[pose_id].valid) {
         output[index] = score;
         return;
     }
     const auto transform = transforms[pose_id];
     for (std::uint32_t i = 0; i < ligand_count; ++i) {
-        const auto atom = ligand[i];
+        const auto atom = ligand[ligand_begin + i];
         // CPU Vinardo goes RDKit double -> float point -> double arithmetic ->
         // float transformed point. Receptor coordinates remain RDKit doubles.
         const double x = static_cast<double>(static_cast<float>(atom.x));
@@ -113,12 +126,14 @@ bool cuda_upload_vinardo_atoms(const std::vector<GpuVinardoAtom>& atoms,
     return true;
 }
 
-bool cuda_score_vinardo_device(
+namespace {
+bool score_vinardo_device(
     const GpuVinardoAtomsDevice& receptor,
     const GpuVinardoAtomsDevice& ligand,
     const GpuRigidTransformArrayDevice& transforms,
     const std::uint32_t* selected_pose_ids,
     std::uint32_t selected_count,
+    const GpuLigandScoringRange* selected_ranges,
     GpuVinardoScoresDevice& output)
 {
     cuda_free_vinardo_scores(output);
@@ -139,7 +154,7 @@ bool cuda_score_vinardo_device(
     vinardo_score_kernel<<<blocks, block_size>>>(
         receptor.atoms, receptor.count, ligand.atoms, ligand.count,
         transforms.transforms, transforms.count, selected_pose_ids, selected_count,
-        result.scores);
+        selected_ranges, result.scores);
     if (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
         cuda_free_vinardo_scores(result);
         return false;
@@ -147,4 +162,32 @@ bool cuda_score_vinardo_device(
     result.count = selected_count;
     output = result;
     return true;
+}
+} // namespace
+
+bool cuda_score_vinardo_device(
+    const GpuVinardoAtomsDevice& receptor,
+    const GpuVinardoAtomsDevice& ligand,
+    const GpuRigidTransformArrayDevice& transforms,
+    const std::uint32_t* selected_pose_ids,
+    std::uint32_t selected_count,
+    GpuVinardoScoresDevice& output) {
+    return score_vinardo_device(receptor, ligand, transforms, selected_pose_ids,
+        selected_count, nullptr, output);
+}
+
+bool cuda_score_vinardo_batch_device(
+    const GpuVinardoAtomsDevice& receptor,
+    const GpuVinardoAtomsDevice& ligand,
+    const GpuRigidTransformArrayDevice& transforms,
+    const std::uint32_t* selected_pose_ids,
+    std::uint32_t selected_count,
+    const GpuLigandScoringRange* selected_ranges,
+    GpuVinardoScoresDevice& output) {
+    if (selected_count && (!selected_pose_ids || !selected_ranges)) {
+        cuda_free_vinardo_scores(output);
+        return false;
+    }
+    return score_vinardo_device(receptor, ligand, transforms, selected_pose_ids,
+        selected_count, selected_ranges, output);
 }

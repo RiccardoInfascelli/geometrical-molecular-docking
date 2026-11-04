@@ -65,6 +65,11 @@ def load_run(directory, backend):
         raise ValueError(f"Expected {backend} rescoring export: {directory}")
     if integer(summary["top_k"]) == 0:
         raise ValueError("top_k must be positive")
+    export_mode = summary.get("pose_output", "topk")
+    if export_mode == "none" or summary.get("pose_detail", "full") == "compact":
+        raise ValueError("Pose comparison requires --pose-output topk or all and --pose-detail full")
+    if export_mode not in {"topk", "all"}:
+        raise ValueError(f"Unknown pose export mode: {export_mode}")
     for key, value in summary.items():
         if (key.endswith("_A") or key.endswith("_s") or "weight_" in key or
                 key in {"vinardo_alpha", "hybrid_lambda", "operational_clash_fraction"}):
@@ -117,8 +122,10 @@ def load_run(directory, backend):
         orders[index].append(pose_id)
     for index, row in records.items():
         count = len(orders[index])
+        expected = integer(row["candidate_pool"]) if export_mode == "all" else min(
+            integer(summary["top_k"]), integer(row["candidate_pool"]))
         if (count != integer(row["exported_poses"]) or
-                count != min(integer(summary["top_k"]), integer(row["candidate_pool"])) or
+                count != expected or
                 integer(row["candidate_pool"]) > integer(row["survivors"])):
             raise ValueError(f"Incomplete pose export for record {index}")
         if summary["fast_prefilter"] == "none" and row["candidate_pool"] != row["survivors"]:

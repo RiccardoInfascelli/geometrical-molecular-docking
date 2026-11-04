@@ -5,11 +5,11 @@ motore principale. Gli script generano conformeri esterni; il driver di
 ricerca riusa preparazione, matching, Kabsch, clash e Fast del motore.
 Un secondo driver ricalcola WeightedInteraction e Vinardo rep50 sulle trasformazioni salvate
 e ordina le pose con **Hybrid globale, lambda=0.3 e alpha=0.5, senza Fast
-prefilter**. Non serve una GPU nel Docker del Mac.
+prefilter**. La suite usa il motore CPU e non richiede CUDA.
 
-**L'ultima estensione Hybrid globale è work-in-progress: non è ancora
-compilata e validata numericamente.** I comandi descrivono il flusso
-implementato da verificare; non attestano un risultato di accuratezza.
+**Il replay Hybrid globale rimane WIP.** Richiede una validazione numerica
+del workflow completo prima dell'uso scientifico; è distinto dalla suite
+C++ [ligand_conformer_docking](../ligand_conformer_docking/README.md).
 
 ## Ambiente
 
@@ -19,36 +19,28 @@ nell'interprete effettivamente usato, anche quando esiste un ambiente virtuale.
 Il replay Hybrid di un pool già salvato usa Python standard e gli scorer C++:
 non richiede Python RDKit e non rigenera conformeri o pose.
 
-Dal Mac, prima della prova:
+Nell'ambiente Python configurato, dalla radice della repository:
 
 ```sh
-docker exec -w /workspace/geometric-docking geometric-docking-dev \
-  python3 -B experiments/conformer_ensemble/prepare_conformers.py --check
+python3 -B experiments/conformer_ensemble/prepare_conformers.py --check
 ```
 
-Se il controllo fallisce, usare un ambiente RDKit già predisposto oppure
-segnalare la dipendenza mancante, senza installarla automaticamente.
-Il runner completo controlla RDKit prima di aprire molecole o creare output.
+Il controllo segnala l'eventuale modulo mancante. Il runner completo verifica
+RDKit prima di aprire molecole o creare output.
 
 ## Compilazione e test
 
-I comandi seguenti si eseguono sul Mac. Creano una build separata CPU con le
-dipendenze C++ già richieste dal progetto. La dipendenza attuale imposta
-`CMP0167 NEW`: serve un CMake che supporti quella policy, 3.30 o successivo.
-Non si modifica la dipendenza per questo esperimento.
+I comandi seguenti creano una build CPU separata, in un ambiente con le
+[dipendenze del progetto](../../docs/build-e-test.md) configurate.
 
 ```sh
-docker exec -w /workspace/geometric-docking geometric-docking-dev \
-  cmake -S experiments/conformer_ensemble \
-        -B experiments/conformer_ensemble/build -DCMAKE_BUILD_TYPE=Release
+cmake -S experiments/conformer_ensemble \
+  -B experiments/conformer_ensemble/build -DCMAKE_BUILD_TYPE=Release
 
-docker exec -w /workspace/geometric-docking geometric-docking-dev \
-  cmake --build experiments/conformer_ensemble/build \
-        --target conformer_docking conformer_hybrid \
-        conformer_hybrid_ranking_test --parallel 1
+cmake --build experiments/conformer_ensemble/build \
+  --target conformer_docking conformer_hybrid conformer_hybrid_ranking_test --parallel 1
 
-docker exec -w /workspace/geometric-docking geometric-docking-dev \
-  ctest --test-dir experiments/conformer_ensemble/build --output-on-failure
+ctest --test-dir experiments/conformer_ensemble/build --output-on-failure
 ```
 
 La suite autonoma comprende test sintetici della preparazione, del replay e
@@ -57,28 +49,24 @@ Quest'ultimo fallisce se il modulo manca. Per eseguire soltanto i controlli
 Python del pool salvato, senza RDKit:
 
 ```sh
-docker exec -w /workspace/geometric-docking geometric-docking-dev \
-  python3 -B experiments/conformer_ensemble/hybrid_test.py -v
+python3 -B experiments/conformer_ensemble/hybrid_test.py -v
 ```
 
 `conformer_test.py` contiene anche un test sintetico con RDKit, saltato quando
 il modulo manca. `hybrid_ranking_test.cpp` controlla normalizzazione comune,
 Top-K locali, Top-X globale, parità, pool vuoti/costanti e indipendenza
 dall'RMSD; `hybrid_test.py` controlla completezza e identità dei record salvati,
-assenza di prefilter e protezione degli output. Sono verifiche predisposte,
-non una validazione C++ già completata del nuovo percorso.
+assenza di prefilter e protezione degli output. Questi controlli non sostituiscono
+la validazione scientifica del replay sul pool dichiarato.
 
 ## Riutilizzare i conformeri e le pose di 1a1e
 
-Se il pool completo esiste già, non ripetere ETKDG, MMFF o docking. Esempio
-per il run già generato, dopo avere compilato e controllato il nuovo driver:
+Se il pool completo esiste già, il replay non ripete ETKDG, MMFF o docking:
 
 ```sh
-docker exec -w /workspace/geometric-docking geometric-docking-dev \
-  python3 -B experiments/conformer_ensemble/rank_hybrid.py \
-    --run experiments/conformer_ensemble/runs/1a1e-20261023T062143Z-433 \
-    --complex /workspace/datasets/refined-set/1a1e \
-    --local-k 10 --top-x 10
+python3 -B experiments/conformer_ensemble/rank_hybrid.py \
+  --run /path/to/saved-run --complex /path/to/refined-set/1a1e \
+  --local-k 10 --top-x 10
 ```
 
 `--run` identifica la directory che contiene `preparation/`, `docking/` e
@@ -97,15 +85,13 @@ senza riscrivere il protocollo originale.
 
 ## Prima prova su 1a1e
 
-Per generare un nuovo pool, soltanto se quello salvato non basta e dopo avere
-verificato il nuovo percorso Hybrid:
+Per generare un nuovo pool:
 
 ```sh
-docker exec -w /workspace/geometric-docking geometric-docking-dev \
-  python3 -B experiments/conformer_ensemble/run_experiment.py \
-    --complex /workspace/datasets/refined-set/1a1e \
-    --num-conformers 10 --num-candidates 30 --seed 20261023 \
-    --min-rmsd 0.5 --energy-window 10 --max-iterations 500
+python3 -B experiments/conformer_ensemble/run_experiment.py \
+  --complex /path/to/refined-set/1a1e \
+  --num-conformers 10 --num-candidates 30 --seed 20261023 \
+  --min-rmsd 0.5 --energy-window 10 --max-iterations 500
 ```
 
 Gli input sono `1a1e_protein.pdb`, `1a1e_pocket.pdb` e `1a1e_ligand.mol2`, letti
@@ -145,8 +131,8 @@ e il protocollo segnala l'assenza di selezione energetica.
 
 Eventuali H aggiunti alla copia di lavoro rimangono in coda. L'export conserva
 le prime N coordinate, senza `RemoveHs`, preservando anche tutti gli H originali.
-`AddHs` non ripara automaticamente MOL2 carenti di idrogeni: questa prima
-versione non è una procedura generale di preparazione della protonazione.
+`AddHs` non ripara automaticamente MOL2 carenti di idrogeni: il workflow
+non è una procedura generale di preparazione della protonazione.
 
 L'export cambia soltanto nome del record e coordinate ATOM: conserva ID, ordine,
 nomi, tipi, cariche e legami. Ogni conformero viene riletto e confrontato con
@@ -168,7 +154,12 @@ le pose esportate né entra nel ranking finale Hybrid. Il rescoring riusa
 `score_weighted_interactions()` e `VinardoLikeScorer::score()` su tutte le pose
 salvate. WeightedInteraction considera per default le aree della pocket; il replay ammette
 `--interaction-region protein`. Vinardo usa la proteina completa supportata e lo
-stesso cutoff atomico stretto di 8 Å, senza crop.
+stesso cutoff atomico stretto di 8 Å.
+
+Per il protocollo senza crop, `DOCKING_AREA_CROP_MARGIN_A` deve essere assente.
+Questi runner non la azzerano: un valore ereditato modifica la preparazione delle
+aree chimiche e deve essere coerente fra generazione e replay. La compatibilità
+di questa impostazione nei pool salvati richiede un controllo esplicito.
 
 Il riferimento rimane il ligando cristallografico nel sistema della proteina,
 anche per gli input ETKDG. Il mapping atomico completo, compresi H e grafo,
@@ -203,7 +194,7 @@ valori assoluti da confrontare con quelli dell'ensemble.
 | `docking/poses.csv` | Tutti i superstiti con Fast, RMSD e trasformazioni R/t a 17 cifre. |
 | `docking/records.csv` | Conteggi, Top-1 Fast diagnostica, miglior RMSD disponibile e tempi per conformero. |
 | `docking/protocol.csv` | Parametri del motore, pesi, indice e costo iniziale comune. |
-| `fast_summary.csv`, `fast_comparison.csv` | Diagnostiche Fast del nuovo runner; non sono il risultato finale Hybrid. |
+| `fast_summary.csv`, `fast_comparison.csv` | Diagnostiche Fast; non sono il risultato finale Hybrid. |
 | `hybrid/ranking/global_rankings.csv` | Top-X globale: conformero, ID posa, ranghi locale/globale, WeightedInteraction, rep50, Hybrid, RMSD e successo. |
 | `hybrid/ranking/local_rankings.csv` | Top-K locali con score normalizzati sul pool comune. |
 | `hybrid/ranking/baseline_rankings.csv` | Baseline cristallografica classificata separatamente. |
@@ -233,7 +224,7 @@ I tempi del generatore separano preparazione ligando, ricerca, Fast e RMSD.
 `online_s` somma i primi tre, escludendo RMSD e output. Preparazione proteica e
 indice sono un costo comune conteggiato una volta. Il wall del processo include
 anche questi costi, RMSD ed export; quello complessivo aggiunge ETKDG/MMFF
-e, nel nuovo runner completo, il rescoring Hybrid. Il replay registra
+e, nel runner completo, il rescoring Hybrid. Il replay registra
 preparazione scorer, validazione input/RMSD, WeightedInteraction, Vinardo e ranking
 separatamente; non è una nuova misura della ricerca geometrica.
 Sono misure descrittive singole, non benchmark ripetuti. Non si deve omettere
